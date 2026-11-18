@@ -25,7 +25,8 @@ module raijin_out #(
     reg               v1;
     reg [TW-1:0]      tag1;
     reg [7:0]         em1, em2;
-    integer c;
+    // one loop variable per always block, so synthesis never infers a register for it
+    integer c1, c2, c3, c4;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) v1 <= 1'b0;
         else        v1 <= in_valid;
@@ -33,8 +34,8 @@ module raijin_out #(
     always @(posedge clk) begin
         tag1 <= in_tag;
         em1  <= emax;
-        for (c = 0; c < D; c = c + 1)
-            y1[c] <= $signed(acc[c*24 +: 24]) * $signed({1'b0, r});
+        for (c1 = 0; c1 < D; c1 = c1 + 1)
+            y1[c1] <= $signed(acc[c1*24 +: 24]) * $signed({1'b0, r});
     end
 
     // ---------------- stage 2 ----------------
@@ -43,8 +44,8 @@ module raijin_out #(
     integer b;
     always @(*) begin
         orv = 38'd0;
-        for (c = 0; c < D; c = c + 1)
-            orv = orv | (y1[c] ^ {38{y1[c][37]}});
+        for (c2 = 0; c2 < D; c2 = c2 + 1)
+            orv = orv | (y1[c2] ^ {38{y1[c2][37]}});
         nb = 6'd0;
         for (b = 0; b < 38; b = b + 1)
             if (orv[b]) nb = b + 1;
@@ -62,7 +63,7 @@ module raijin_out #(
         tag2 <= tag1;
         em2  <= em1;
         sh2  <= (nb > 6'd7) ? (nb - 6'd7) : 6'd0;
-        for (c = 0; c < D; c = c + 1) y2[c] <= y1[c];
+        for (c3 = 0; c3 < D; c3 = c3 + 1) y2[c3] <= y1[c3];
     end
 
     // ---------------- stage 3 ----------------
@@ -70,12 +71,12 @@ module raijin_out #(
     reg [D*8-1:0]     o_n;
     wire [9:0]        eo_w = {2'b00, em2} + {4'd0, sh2};
     always @(*) begin
-        for (c = 0; c < D; c = c + 1) begin
-            if (sh2 == 6'd0) rnd = {y2[c][37], y2[c]};
-            else             rnd = ($signed({y2[c][37], y2[c]}) + (39'sd1 <<< (sh2 - 6'd1))) >>> sh2;
-            if (rnd > 39'sd127)       o_n[c*8 +: 8] = 8'sd127;
-            else if (rnd < -39'sd128) o_n[c*8 +: 8] = -8'sd128;
-            else                      o_n[c*8 +: 8] = rnd[7:0];
+        for (c4 = 0; c4 < D; c4 = c4 + 1) begin
+            if (sh2 == 6'd0) rnd = {y2[c4][37], y2[c4]};
+            else             rnd = ($signed({y2[c4][37], y2[c4]}) + (39'sd1 <<< (sh2 - 6'd1))) >>> sh2;
+            if (rnd > 39'sd127)       o_n[c4*8 +: 8] = 8'sd127;
+            else if (rnd < -39'sd128) o_n[c4*8 +: 8] = -8'sd128;
+            else                      o_n[c4*8 +: 8] = rnd[7:0];
         end
     end
     always @(posedge clk or negedge rst_n) begin
