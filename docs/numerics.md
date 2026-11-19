@@ -57,6 +57,12 @@ one because early keys are compared with a running max that is still low.
 - Softmax lane: stage A (max), stage B (exp2, l update), then the accumulate
   array registers the update. One key per cycle in fused mode.
 - Output packer: 3 stages (multiply by r, leading-one detect, shift and round).
+- The score buffer is banked by lane: lane r only ever touches query rows
+  g·P + r, so bank r holds those 4 rows × 16 entries, with one read port and
+  one write port. The entry index is {g, j}, which is also the pipeline tag.
+- e_vmax (a pairwise max tree) and the per-row V shifts dv[j] are registered.
+  They only change through the bus while the core is idle, so this costs no
+  cycles and keeps the max tree off the accumulate path.
 
 | Phase | Unfused cycles | Fused cycles |
 | --- | --- | --- |

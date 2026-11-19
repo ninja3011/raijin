@@ -45,13 +45,14 @@ def main():
     ap.add_argument("what", nargs="?", default="all", choices=["blocks", "core", "uart", "all"])
     ap.add_argument("--sim", default="icarus")
     ap.add_argument("--n", type=int, default=16)
+    ap.add_argument("--p", type=int, default=4, help="DPUs / softmax lanes")
     args = ap.parse_args()
     (ROOT / "results").mkdir(exist_ok=True)
     if args.what in ("blocks", "all"):
         for top in BLOCKS:
             run(top, "test_blocks", args.sim)
     if args.what in ("core", "all"):
-        run("raijin_core", "test_core", args.sim, params={"N": args.n, "D": 16},
+        run("raijin_core", "test_core", args.sim, params={"N": args.n, "D": 16, "P": args.p},
             extra_env={"RAIJIN_N": str(args.n), "RAIJIN_D": "16"})
     if args.what in ("uart", "all"):
         run("raijin_uart_tb_top", "test_uart", args.sim)
