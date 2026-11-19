@@ -128,14 +128,31 @@ module raijin_core #(
     end
 
     // ------------------------------------------------------------------
-    // V exponent handling: e_vmax and per-row shift dv = e_vmax - e_v[j]
+    // V exponent handling: e_vmax and per-row shift dv = e_vmax - e_v[j].
+    // Both are registered: e_v only changes through the bus while idle, and a
+    // pass first needs them several cycles after start, so the 16-way max tree
+    // stays off the accumulate path.
     // ------------------------------------------------------------------
-    reg [7:0] emax;
-    integer ei;
+    reg [7:0] emax_c, emax;
+    reg [4:0] dvr [0:N-1];
+    integer ei, ew, di;
+    reg [N*8-1:0] mt;     // pairwise max tree, log2(N) levels
     always @(*) begin
-        emax = 8'd0;
         for (ei = 0; ei < N; ei = ei + 1)
-            if (evm[ei] > emax) emax = evm[ei];
+            mt[ei*8 +: 8] = evm[ei];
+        for (ew = N / 2; ew >= 1; ew = ew / 2)
+            for (ei = 0; ei < ew; ei = ei + 1)
+                mt[ei*8 +: 8] = (mt[(2*ei)*8 +: 8] > mt[(2*ei+1)*8 +: 8]) ?
+                                mt[(2*ei)*8 +: 8] : mt[(2*ei+1)*8 +: 8];
+        emax_c = mt[7:0];
+    end
+    reg [7:0] dtmp;
+    always @(posedge clk) begin
+        emax <= emax_c;
+        for (di = 0; di < N; di = di + 1) begin
+            dtmp    = emax - evm[di];
+            dvr[di] <= (dtmp > 8'd31) ? 5'd31 : dtmp[4:0];
+        end
     end
 
     // ------------------------------------------------------------------
@@ -314,8 +331,7 @@ module raijin_core #(
     end
 
     wire acc_clear = (state == U_PV_CLR) || (state == F_CLR);
-    wire [7:0] dv_full = emax - evm[acc_j];
-    wire [4:0] acc_dv  = (dv_full > 8'd31) ? 5'd31 : dv_full[4:0];
+    wire [4:0] acc_dv  = dvr[acc_j];
     wire [P*D*24-1:0] acc;
     raijin_acc_array #(.R(P), .D(D)) u_acc (
         .clk(clk), .rst_n(rst_n), .clear(acc_clear), .mf(mf),
