@@ -50,7 +50,6 @@ module raijin_core #(
     reg [7:0]     ekm [0:N-1];
     reg [7:0]     evm [0:N-1];
     reg [7:0]     eom [0:N-1];
-    reg [11:0]    sbuf [0:N*N-1];
     reg [12:0]    rinv [0:N-1];
 
     // ------------------------------------------------------------------
@@ -233,10 +232,33 @@ module raijin_core #(
     wire [P-1:0]    sm_rvalid;
     wire [P*13-1:0] sm_r;
 
+    // ------------------------------------------------------------------
+    // Score buffer, banked by lane. Lane r only ever touches query rows
+    // g*P + r, so bank r holds those NG rows (entry index {g, j}, which is
+    // also the pipeline tag). Each bank has one read port, shared by the
+    // softmax passes and the P V phase, and one write port, used by the
+    // QK^T phase (scores) and by softmax pass 2 (p codes), never together.
+    // ------------------------------------------------------------------
+    wire [P*12-1:0] sb_rd;
+    generate
+        for (gr = 0; gr < P; gr = gr + 1) begin : g_sbank
+            reg [11:0] bank [0:NG*N-1];
+            always @(posedge clk) begin
+                if (!fused) begin
+                    if (dpu_valid[gr])
+                        bank[dpu_tag[gr*TW +: TW]] <= score[gr*12 +: 12];
+                    else if (sm_ovalid[gr])
+                        bank[sm_otag[gr*TW +: TW]] <=
+                            mf ? {4'd0, sm_sb[gr*4 +: 4], sm_sa[gr*4 +: 4]} : {3'd0, sm_p[gr*9 +: 9]};
+                end
+            end
+            assign sb_rd[gr*12 +: 12] = bank[issue_tag];
+        end
+    endgenerate
+
     generate
         for (gr = 0; gr < P; gr = gr + 1) begin : g_sm
-            wire [LN-1:0] srow = g * P + gr;
-            wire signed [11:0] s_in = fused ? score[gr*12 +: 12] : sbuf[srow * N + j];
+            wire signed [11:0] s_in = fused ? score[gr*12 +: 12] : sb_rd[gr*12 +: 12];
             wire signed [8:0] m_unused;
             wire [12:0]       l_unused;
             raijin_softmax_lane #(.TW(TW)) u_lane (
@@ -253,22 +275,6 @@ module raijin_core #(
     endgenerate
 
     // ------------------------------------------------------------------
-    // Score buffer writes: S from the DPU array, then p codes from softmax
-    // ------------------------------------------------------------------
-    integer wi;
-    always @(posedge clk) begin
-        if (!fused) begin
-            for (wi = 0; wi < P; wi = wi + 1) begin
-                if (dpu_valid[wi])
-                    sbuf[(dpu_tag[wi*TW + LN +: LG] * P + wi) * N + dpu_tag[wi*TW +: LN]] <= score[wi*12 +: 12];
-                if (sm_ovalid[wi])
-                    sbuf[(sm_otag[wi*TW + LN +: LG] * P + wi) * N + sm_otag[wi*TW +: LN]] <=
-                        mf ? {4'd0, sm_sb[wi*4 +: 4], sm_sa[wi*4 +: 4]} : {3'd0, sm_p[wi*9 +: 9]};
-            end
-        end
-    end
-
-    // ------------------------------------------------------------------
     // P V operand registers (unfused): read p codes back from the buffer
     // ------------------------------------------------------------------
     reg            pv_valid;
@@ -281,8 +287,7 @@ module raijin_core #(
     end
     always @(posedge clk) begin
         pv_j <= j;
-        for (pi = 0; pi < P; pi = pi + 1)
-            pv_code[pi*12 +: 12] <= sbuf[(g * P + pi) * N + j];
+        pv_code <= sb_rd;
     end
 
     function [8:0] term;

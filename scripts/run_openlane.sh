@@ -7,4 +7,4 @@ set -e
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TAG="${RAIJIN_RUN_TAG:-run_$(date +%Y%m%d_%H%M)}"
 bash "$REPO/scripts/dock.sh" \
-  "export STD_CELL_LIBRARY=sky130_fd_sc_hd; librelane --pdk-root /foss/pdks --manual-pdk -p sky130A --run-tag $TAG $* openlane/config.json"
+  "export STD_CELL_LIBRARY=sky130_fd_sc_hd; librelane --pdk-root /foss/pdks --manual-pdk -p sky130A --run-tag $TAG $* ${RAIJIN_CONFIG:-openlane/config.json}"
