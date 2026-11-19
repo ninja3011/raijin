@@ -1,0 +1,165 @@
+"""Full-pass cocotb tests: the RTL core must match the golden model bit for bit."""
+import os
+import sys
+
+import cocotb
+import numpy as np
+from cocotb.clock import Clock
+from cocotb.triggers import ClockCycles, RisingEdge, ReadOnly
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "model"))
+import raijin_model as rm  # noqa: E402
+
+N = int(os.environ.get("RAIJIN_N", 16))
+D = int(os.environ.get("RAIJIN_D", 16))
+
+
+class Bus:
+    def __init__(self, dut):
+        self.dut = dut
+
+    async def write(self, addr, data):
+        d = self.dut
+        d.addr.value = addr
+        d.wdata.value = data & 0xFF
+        d.we.value = 1
+        await RisingEdge(d.clk)
+        d.we.value = 0
+
+    async def read(self, addr):
+        d = self.dut
+        d.addr.value = addr
+        d.re.value = 1
+        await RisingEdge(d.clk)
+        d.re.value = 0
+        await ReadOnly()
+        val = int(d.rdata.value)
+        await RisingEdge(d.clk)
+        return val
+
+    async def read32(self, addr):
+        b = [await self.read(addr + i) for i in range(4)]
+        return b[0] | b[1] << 8 | b[2] << 16 | b[3] << 24
+
+
+async def setup(dut):
+    cocotb.start_soon(Clock(dut.clk, 20, unit="ns").start())
+    dut.rst_n.value = 0
+    dut.we.value = 0
+    dut.re.value = 0
+    dut.addr.value = 0
+    dut.wdata.value = 0
+    await ClockCycles(dut.clk, 3)
+    dut.rst_n.value = 1
+    await ClockCycles(dut.clk, 2)
+    return Bus(dut)
+
+
+async def load(bus, q, eq, k, ek, v, ev):
+    for base, mat in ((0x0000, q), (0x1000, k), (0x2000, v)):
+        for r in range(N):
+            for c in range(D):
+                await bus.write(base + r * D + c, int(mat[r][c]))
+    for base, ex in ((0x4000, eq), (0x4100, ek), (0x4200, ev)):
+        for r in range(N):
+            await bus.write(base + r, int(ex[r]))
+
+
+async def run_pass(bus, fused, mode, offset=0):
+    dut = bus.dut
+    await bus.write(0x5001, offset)
+    await bus.write(0x5000, 1 | (int(fused) << 1) | (mode << 2))
+    for _ in range(5000):
+        await RisingEdge(dut.clk)
+        if int(dut.done.value):
+            break
+    else:
+        raise AssertionError("pass did not finish")
+    o = np.zeros((N, D), dtype=np.int64)
+    for r in range(N):
+        for c in range(D):
+            b = await bus.read(0x3000 + r * D + c)
+            o[r][c] = b - 256 if b & 0x80 else b
+    eo = np.array([await bus.read(0x4300 + r) for r in range(N)])
+    cycles = await bus.read32(0x5004)
+    skips = await bus.read32(0x5008)
+    return o, eo, cycles, skips
+
+
+CASES = [
+    ("random", dict(scale=1.0)),
+    ("sharp", dict(scale=2.5)),
+    ("outliers", dict(scale=1.5, outliers=True)),
+]
+
+
+@cocotb.test()
+async def test_ids(dut):
+    bus = await setup(dut)
+    assert await bus.read(0x500C) == N
+    assert await bus.read(0x500D) == D
+    assert await bus.read(0x500F) == 1
+
+
+@cocotb.test()
+async def test_all_modes(dut):
+    """Every case, both dataflows, all three exponent modes, bit-exact."""
+    bus = await setup(dut)
+    rng = np.random.default_rng(int(os.environ.get("RAIJIN_SEED", 7)))
+    summary = []
+    for name, kw in CASES:
+        qf, kf, vf = rm.random_case(rng, n=N, d=D, **kw)
+        args = rm.prepare(qf, kf, vf)
+        await load(bus, *args)
+        ref = rm.reference(qf, kf, vf)
+        for fused in (False, True):
+            for mode in (rm.MODE_EXACT, rm.MODE_MF1, rm.MODE_MF2):
+                exp = rm.attention(*args, fused=fused, mode=mode)
+                o, eo, cycles, skips = await run_pass(bus, fused, mode)
+                tag = f"{name} fused={int(fused)} mode={mode}"
+                assert np.array_equal(o, exp.o), f"{tag}: output mismatch\nrtl=\n{o}\nmodel=\n{exp.o}"
+                assert np.array_equal(eo, exp.eo), f"{tag}: exponent mismatch rtl={eo} model={exp.eo}"
+                assert skips == exp.skips, f"{tag}: skips rtl={skips} model={exp.skips}"
+                got = rm.mx_dequantize(o, eo)
+                cos = float(np.sum(got * ref) / np.linalg.norm(got) / np.linalg.norm(ref))
+                summary.append(f"{tag:34s} cycles={cycles:4d} skips={skips:3d} cos={cos:.5f}")
+                dut._log.info(summary[-1])
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", f"core_N{N}_D{D}.txt"), "w") as f:
+        f.write("\n".join(summary) + "\n")
+
+
+@cocotb.test()
+async def test_offset_and_reuse(dut):
+    """A non-zero requant offset, and back-to-back passes without reloading."""
+    bus = await setup(dut)
+    rng = np.random.default_rng(99)
+    qf, kf, vf = rm.random_case(rng, n=N, d=D, scale=0.7)
+    args = rm.prepare(qf, kf, vf)
+    await load(bus, *args)
+    for off in (2, -3):
+        for fused in (True, False):
+            exp = rm.attention(*args, fused=fused, mode=rm.MODE_MF2, offset=off)
+            o, eo, _, skips = await run_pass(bus, fused, rm.MODE_MF2, offset=off)
+            assert np.array_equal(o, exp.o), f"off={off} fused={fused}\n{o}\n{exp.o}"
+            assert np.array_equal(eo, exp.eo), f"off={off} fused={fused} {eo} {exp.eo}"
+            assert skips == exp.skips
+
+
+@cocotb.test()
+async def test_random_regression(dut):
+    """Many random tensors with random exponents spread, fused and unfused, exact and MF2."""
+    bus = await setup(dut)
+    rng = np.random.default_rng(1234)
+    iters = int(os.environ.get("RAIJIN_ITERS", 6))
+    for it in range(iters):
+        scale = float(rng.uniform(0.3, 4.0))
+        qf, kf, vf = rm.random_case(rng, n=N, d=D, scale=scale, outliers=bool(it % 2))
+        args = rm.prepare(qf, kf, vf)
+        await load(bus, *args)
+        for fused in (False, True):
+            mode = int(rng.integers(0, 3))
+            exp = rm.attention(*args, fused=fused, mode=mode)
+            o, eo, _, skips = await run_pass(bus, fused, mode)
+            assert np.array_equal(o, exp.o), f"iter {it} fused={fused} mode={mode}"
+            assert np.array_equal(eo, exp.eo)
+            assert skips == exp.skips

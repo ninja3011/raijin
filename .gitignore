@@ -1,0 +1,12 @@
+.scratch/
+sim_build/
+__pycache__/
+*.pyc
+results.xml
+*.vcd
+*.fst
+openlane/runs/
+fpga/vivado/
+fpga/*.jou
+fpga/*.log
+.Xil/

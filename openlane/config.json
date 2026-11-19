@@ -1,0 +1,29 @@
+{
+    "DESIGN_NAME": "raijin_core",
+    "VERILOG_FILES": [
+        "dir::../rtl/raijin_dpu.v",
+        "dir::../rtl/raijin_requant.v",
+        "dir::../rtl/raijin_exp2.v",
+        "dir::../rtl/raijin_softmax_lane.v",
+        "dir::../rtl/raijin_acc_array.v",
+        "dir::../rtl/raijin_out.v",
+        "dir::../rtl/raijin_core.v"
+    ],
+    "CLOCK_PORT": "clk",
+    "CLOCK_NET": "clk",
+    "CLOCK_PERIOD": 20,
+    "FP_SIZING": "relative",
+    "FP_CORE_UTIL": 40,
+    "PL_TARGET_DENSITY_PCT": 50,
+    "SYNTH_STRATEGY": "AREA 0",
+    "SYNTH_ABC_BUFFERING": true,
+    "MAX_FANOUT_CONSTRAINT": 16,
+    "RUN_HEURISTIC_DIODE_INSERTION": true,
+    "GRT_REPAIR_ANTENNAS": true,
+    "DRT_THREADS": 16,
+    "RUN_KLAYOUT_XOR": false,
+    "RSZ_CORNERS": ["nom_tt_025C_1v80", "nom_ff_n40C_1v95"],
+    "pdk::sky130A": {
+        "STD_CELL_LIBRARY": "sky130_fd_sc_hd"
+    }
+}
