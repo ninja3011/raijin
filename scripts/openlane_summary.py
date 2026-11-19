@@ -38,8 +38,18 @@ KEYS = [
 
 def main(run):
     path = os.path.join(run, "final", "metrics.json")
+    if not os.path.exists(path):
+        # flow still running: use the latest step's state
+        steps = sorted(d for d in os.listdir(run) if d[:2].isdigit())
+        for d in reversed(steps):
+            p = os.path.join(run, d, "state_out.json")
+            if os.path.exists(p):
+                path = p
+                break
     with open(path) as f:
         m = json.load(f)
+    m = m.get("metrics", m)
+    print(f"metrics from {path}", file=sys.stderr)
     lines = [f"# OpenLane 2 (LibreLane) results: `{os.path.basename(run.rstrip('/'))}`", "",
              "sky130A, sky130_fd_sc_hd, 50 MHz clock (20 ns).", "",
              "| Metric | Value |", "| --- | --- |"]
