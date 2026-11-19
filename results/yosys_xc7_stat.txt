@@ -1,0 +1,37 @@
+
+13. Printing statistics.
+
+=== raijin_arty_top ===
+
+        +----------Local Count, excluding submodules.
+        | 
+    23928 wires
+   109951 wire bits
+     1305 public wires
+    22584 public wire bits
+        5 ports
+        8 port bits
+    40566 cells
+       22   $scopeinfo
+        1   BUFG
+     1233   CARRY4
+      144   DSP48E1
+     1871   FDCE
+        9   FDPE
+     4594   FDRE
+      150   FDSE
+        3   IBUF
+      159   INV
+      895   LUT1
+     3875   LUT2
+     9819   LUT3
+     3207   LUT4
+     5584   LUT5
+     6917   LUT6
+        1   MMCME2_BASE
+     1100   MUXF7
+      427   MUXF8
+        5   OBUF
+      548   RAM32M
+        2   SRL16E
+
