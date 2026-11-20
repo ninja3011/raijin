@@ -18,7 +18,9 @@
 //
 // Bus: byte-wide, 16-bit address, all four inputs registered on entry.
 // A write takes effect two rising edges after it is presented. A read returns
-// rdata after the third rising edge (RD_LATENCY = 3). Q/K/V/O and the exponent
+// rdata after the third rising edge (RD_LATENCY = 3).
+// The accumulators and the output stage each carry one extra pipeline register
+// for timing; the controller's drain counts cover them. Q/K/V/O and the exponent
 // registers are accessible only while the core is idle.
 //   0x0rcc  Q[r][c]   (write)          0x4000+r  e_q[r]  (r/w)
 //   0x1rcc  K[r][c]   (write)          0x4100+r  e_k[r]  (r/w)
@@ -170,7 +172,8 @@ module raijin_core #(
         F_CLR      = 5'd15,
         F_STREAM   = 5'd16,
         F_DRAIN    = 5'd17,
-        S_DONE     = 5'd18;
+        S_DONE     = 5'd18,
+        OUT_WAIT   = 5'd19;
 
     reg [4:0]    state;
     reg [LG-1:0] g;
@@ -468,10 +471,25 @@ module raijin_core #(
     wire [LN-1:0]     o_tag;
     wire [D*8-1:0]    o_row;
     wire [7:0]        o_e;
+    // stage 0: register the selected accumulator row and its 1/l, so the row
+    // select does not sit in front of the 24 x 13 multipliers
+    reg              o0_v;
+    reg [LN-1:0]     o0_tag;
+    reg [D*24-1:0]   o0_acc;
+    reg [12:0]       o0_r;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) o0_v <= 1'b0;
+        else        o0_v <= out_issue;
+    end
+    always @(posedge clk) begin
+        o0_tag <= out_row_i;
+        o0_acc <= acc[orow*D*24 +: D*24];
+        o0_r   <= rinv[out_row_i];
+    end
     raijin_out #(.D(D), .TW(LN)) u_out (
         .clk(clk), .rst_n(rst_n),
-        .in_valid(out_issue), .in_tag(out_row_i),
-        .acc(acc[orow*D*24 +: D*24]), .r(rinv[out_row_i]), .emax(emax),
+        .in_valid(o0_v), .in_tag(o0_tag),
+        .acc(o0_acc), .r(o0_r), .emax(emax),
         .out_valid(o_valid), .out_tag(o_tag), .o(o_row), .eo(o_e)
     );
     always @(posedge clk) begin
@@ -703,7 +721,7 @@ module raijin_core #(
                 U_PV: begin
                     j <= j + 1'b1;
                     if (last_j) begin
-                        dcnt  <= 4'd3;
+                        dcnt  <= 4'd4;
                         state <= U_PV_DRAIN;
                     end
                 end
@@ -718,14 +736,16 @@ module raijin_core #(
                     orow <= orow + 1'b1;
                     if (decode || orow == P - 1) begin
                         if (decode || last_g) begin
-                            dcnt  <= 4'd3;
+                            dcnt  <= 4'd4;
                             state <= OUT_DRAIN;
                         end else begin
                             g     <= g + 1'b1;
-                            state <= fused ? F_CLR : U_PV_CLR;
+                            state <= OUT_WAIT;
                         end
                     end
                 end
+                // one cycle so the last O write (port 0) lands before the next V read
+                OUT_WAIT: state <= fused ? F_CLR : U_PV_CLR;
                 OUT_DRAIN: begin
                     dcnt <= dcnt - 1'b1;
                     if (dcnt == 0) state <= S_DONE;

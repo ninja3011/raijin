@@ -7,6 +7,7 @@
 // replaces it with two shifts and an add driven by the codes sa/sb, which give
 // the same value because p = 2^(8-sa) + 2^(8-sb) there.
 // A row whose en is low keeps its value (underflow skip, delta is 0 then).
+// The product is registered, so an update lands two edges after its inputs.
 `default_nettype none
 module raijin_acc_array #(
     parameter R = 4,
@@ -32,6 +33,12 @@ module raijin_acc_array #(
             wire [3:0] sar = sa[gr*4 +: 4];
             wire [3:0] sbr = sb[gr*4 +: 4];
             wire [4:0] dr  = delta[gr*5 +: 5];
+            reg  [4:0] dr_r;
+            reg        en_r;
+            always @(posedge clk) dr_r <= dr;
+            always @(posedge clk or negedge rst_n)
+                if (!rst_n) en_r <= 1'b0;
+                else        en_r <= en[gr] && !clear;
             for (gc = 0; gc < D; gc = gc + 1) begin : g_lane
                 wire signed [7:0]  vc = v[gc*8 +: 8];
                 // exact: 9x8 multiply
@@ -43,11 +50,13 @@ module raijin_acc_array #(
                 wire signed [17:0] prod_m = ta + tb;
                 wire signed [17:0] prod = mf ? prod_m : prod_x;
                 wire signed [17:0] t_sh = prod >>> dv;
+                reg  signed [17:0] t_r;
                 reg  signed [23:0] a;
+                always @(posedge clk) t_r <= t_sh;
                 always @(posedge clk or negedge rst_n) begin
                     if (!rst_n)                a <= 24'sd0;
                     else if (clear)            a <= 24'sd0;
-                    else if (en[gr])           a <= (a >>> dr) + $signed({{6{t_sh[17]}}, t_sh});
+                    else if (en_r)             a <= (a >>> dr_r) + $signed({{6{t_r[17]}}, t_r});
                 end
                 assign acc[(gr*D + gc)*24 +: 24] = a;
             end
