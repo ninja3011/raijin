@@ -29,6 +29,7 @@ module raijin_bridge (
     reg [7:0] cmd;
     reg [8:0] left;      // bytes remaining in a burst, minus one
     reg       tx_wait;   // one-cycle guard so busy is seen after start
+    reg [1:0] rwait;     // core read latency: rdata is valid 3 edges after re
 
     always @(posedge clk) begin
         if (rst) begin
@@ -76,10 +77,14 @@ module raijin_bridge (
                     else           left <= left - 1'b1;
                 end
                 S_RD: begin
-                    re <= 1'b1;
-                    st <= S_RDWAIT;
+                    re    <= 1'b1;
+                    rwait <= 2'd2;
+                    st    <= S_RDWAIT;
                 end
-                S_RDWAIT: st <= S_RDCAP;       // core samples re this cycle
+                S_RDWAIT: begin                // core sees re in the first cycle here
+                    rwait <= rwait - 1'b1;
+                    if (rwait == 0) st <= S_RDCAP;
+                end
                 S_RDCAP: begin
                     tx_data <= rdata;
                     st      <= S_TX;

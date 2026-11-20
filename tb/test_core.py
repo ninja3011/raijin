@@ -12,6 +12,7 @@ import raijin_model as rm  # noqa: E402
 
 N = int(os.environ.get("RAIJIN_N", 16))
 D = int(os.environ.get("RAIJIN_D", 16))
+RD_LATENCY = 3   # rdata is valid after the third rising edge following re
 
 
 class Bus:
@@ -32,6 +33,7 @@ class Bus:
         d.re.value = 1
         await RisingEdge(d.clk)
         d.re.value = 0
+        await ClockCycles(d.clk, RD_LATENCY - 1)
         await ReadOnly()
         val = int(d.rdata.value)
         await RisingEdge(d.clk)
@@ -69,18 +71,30 @@ async def run_pass(bus, fused, mode, offset=0):
     dut = bus.dut
     await bus.write(0x5001, offset)
     await bus.write(0x5000, 1 | (int(fused) << 1) | (mode << 2))
+    await wait_done(dut)
+    return await read_out(bus)
+
+
+async def wait_done(dut):
+    # the start write lands two edges after it is presented; let done drop first
+    await ClockCycles(dut.clk, 3)
     for _ in range(5000):
         await RisingEdge(dut.clk)
         if int(dut.done.value):
             break
     else:
         raise AssertionError("pass did not finish")
+
+
+async def read_out(bus, rows=None):
+    rows = range(N) if rows is None else rows
     o = np.zeros((N, D), dtype=np.int64)
-    for r in range(N):
+    eo = np.zeros(N, dtype=np.int64)
+    for r in rows:
         for c in range(D):
             b = await bus.read(0x3000 + r * D + c)
             o[r][c] = b - 256 if b & 0x80 else b
-    eo = np.array([await bus.read(0x4300 + r) for r in range(N)])
+        eo[r] = await bus.read(0x4300 + r)
     cycles = await bus.read32(0x5004)
     skips = await bus.read32(0x5008)
     return o, eo, cycles, skips
@@ -98,7 +112,8 @@ async def test_ids(dut):
     bus = await setup(dut)
     assert await bus.read(0x500C) == N
     assert await bus.read(0x500D) == D
-    assert await bus.read(0x500F) == 1
+    assert await bus.read(0x500F) == 2
+    assert await bus.read(0x5003) == RD_LATENCY
 
 
 @cocotb.test()
@@ -163,3 +178,39 @@ async def test_random_regression(dut):
             assert np.array_equal(o, exp.o), f"iter {it} fused={fused} mode={mode}"
             assert np.array_equal(eo, exp.eo)
             assert skips == exp.skips
+
+
+@cocotb.test()
+async def test_decode_kv_cache(dut):
+    """Autoregressive decode with a KV cache: each step writes only the new
+    token's Q, K and V rows, then one query attends to every cached key."""
+    bus = await setup(dut)
+    rng = np.random.default_rng(int(os.environ.get("RAIJIN_SEED", 7)) + 5)
+    summary = []
+    for name, kw in CASES:
+        qf, kf, vf = rm.random_case(rng, n=N, d=D, **kw)
+        q, eq, k, ek, v, ev = rm.prepare(qf, kf, vf)
+        ref = rm.reference_causal(qf, kf, vf)
+        mode = rm.MODE_EXACT if name != "sharp" else rm.MODE_MF2
+        for t in range(N):
+            for base, mat in ((0x0000, q), (0x1000, k), (0x2000, v)):
+                for c in range(D):
+                    await bus.write(base + t * D + c, int(mat[t][c]))
+            for base, ex in ((0x4000, eq), (0x4100, ek), (0x4200, ev)):
+                await bus.write(base + t, int(ex[t]))
+            await bus.write(0x5010, t + 1)
+            await bus.write(0x5011, t)
+            await bus.write(0x5000, 1 | (mode << 2) | (1 << 4))
+            await wait_done(dut)
+            o, eo, cycles, skips = await read_out(bus, rows=[t])
+            exp = rm.attention_decode(q, eq, k, ek, v, ev, qrow=t, length=t + 1, mode=mode)
+            assert np.array_equal(o[t], exp.o[0]), f"{name} t={t}: rtl={o[t]} model={exp.o[0]}"
+            assert eo[t] == exp.eo[0], f"{name} t={t}: e rtl={eo[t]} model={exp.eo[0]}"
+            assert skips == exp.skips, f"{name} t={t}: skips rtl={skips} model={exp.skips}"
+            got = rm.mx_dequantize(o[t:t + 1], eo[t:t + 1])[0]
+            cos = float(np.dot(got, ref[t]) / np.linalg.norm(got) / np.linalg.norm(ref[t]))
+            if t in (0, N // 2 - 1, N - 1):
+                summary.append(f"decode {name:8s} mode={mode} len={t + 1:2d} cycles={cycles:4d} cos={cos:.5f}")
+                dut._log.info(summary[-1])
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", f"decode_N{N}_D{D}.txt"), "w") as f:
+        f.write(chr(10).join(summary) + chr(10))
