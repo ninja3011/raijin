@@ -816,3 +816,39 @@ async def test_mixed_precision_kv(dut):
     await write_ptab(bus, list(range(2 * N // 4)))
     with open(os.path.join(os.path.dirname(__file__), "..", "results", f"mixed_kv_N{N}_D{D}.txt"), "w") as f:
         f.write(chr(10).join(summary) + chr(10))
+
+
+LM_VECTORS = os.path.join(os.path.dirname(__file__), "..", "results", "lm_head_vectors.npz")
+
+
+@cocotb.test(skip=not os.path.exists(LM_VECTORS))
+async def test_lm_head(dut):
+    """Replay one real attention head through the RTL: layer 0, head 0 of
+    TinyStories-8M on the prompt line from model/lm_eval.py, as one causal
+    prefill pass. The RTL must match the golden model's causal pass bit for bit."""
+    vec = np.load(LM_VECTORS)
+    t_len = len(vec["tokens"])
+    assert t_len <= N
+    pad = lambda a: np.concatenate([a, np.zeros((N - len(a),) + a.shape[1:], a.dtype)])  # noqa: E731
+    q, k, v = pad(vec["q"]), pad(vec["k"]), pad(vec["v"])
+    # padded rows get a neutral exponent; causal rows < t_len never see them
+    eq, ek, ev = (np.concatenate([vec[e], np.full(N - t_len, 127)]) for e in ("eq", "ek", "ev"))
+    bus = await setup(dut)
+    await load(bus, q, eq, k, ek, v, ev)
+    o, eo, cycles, skips = await run_pass(bus, True, rm.MODE_EXACT, causal=True)
+    exp = rm.attention(q, eq, k, ek, v, ev, fused=True, mode=rm.MODE_EXACT, causal=True)
+    # the benchmark ran each row as a decode step; compare the dequantised rows too
+    got = rm.mx_dequantize(o[:t_len], eo[:t_len])
+    dec = rm.mx_dequantize(vec["o"], vec["eo"])
+    cos = float(np.mean([np.dot(got[i], dec[i]) / (np.linalg.norm(got[i]) * np.linalg.norm(dec[i]) + 1e-30)
+                         for i in range(t_len)]))
+    lines = [f"layer 0 head 0, {t_len} prompt tokens, causal prefill pass: {cycles} cycles, {skips} skips",
+             f"mean row cosine vs the benchmark's decode-step outputs: {cos:.6f}"]
+    for t in range(t_len):
+        ok = np.array_equal(o[t], exp.o[t]) and eo[t] == exp.eo[t]
+        lines.append(f"row {t:2d} token {int(vec['tokens'][t]):5d} e_o={int(eo[t]):3d} "
+                     f"o={' '.join(f'{int(x):4d}' for x in o[t])} {'match' if ok else 'MISMATCH'}")
+        assert ok, f"row {t}: rtl {o[t]} e={eo[t]} model {exp.o[t]} e={exp.eo[t]}"
+    dut._log.info(lines[0])
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", "lm_head_rtl.txt"), "w") as f:
+        f.write(chr(10).join(lines) + chr(10))
