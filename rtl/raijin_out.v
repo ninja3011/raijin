@@ -1,7 +1,7 @@
 // Raijin output stage: per-row requant by 1/l and MXINT8 packing.
 //   y[c]  = acc[c] * r                         (stage 1)
 //   sh    = max(0, bitlen(OR_c |y[c]|') - 7)   (stage 2, leading-one detect)
-//   o[c]  = sat8((y[c] + 2^(sh-1)) >>> sh)     (stage 3)
+//   o[c]  = sat8((y[c] + 2^(sh-1)) >>> sh)     (stage 3, as (y >>> sh) + y[sh-1])
 //   e_o   = clamp(e_vmax + sh - 19, 0, 255)
 //
 // Timing: 1/l (r) and the shift amount (sh) each feed all D lanes, and the
@@ -80,8 +80,10 @@ module raijin_out #(
     always @(*) begin
         for (c4 = 0; c4 < D; c4 = c4 + 1) begin
             sh_l = sh2[(c4/(D/RG))*6 +: 6];
+            // round half up: (y + 2^(sh-1)) >>> sh == (y >>> sh) + y[sh-1], so the
+            // 39-bit carry chain becomes a shift plus a one-bit increment
             if (sh_l == 6'd0) rnd = {y2[c4][37], y2[c4]};
-            else              rnd = ($signed({y2[c4][37], y2[c4]}) + (39'sd1 <<< (sh_l - 6'd1))) >>> sh_l;
+            else              rnd = ($signed({y2[c4][37], y2[c4]}) >>> sh_l) + $signed({38'd0, y2[c4][sh_l - 6'd1]});
             if (rnd > 39'sd127)       o_n[c4*8 +: 8] = 8'sd127;
             else if (rnd < -39'sd128) o_n[c4*8 +: 8] = -8'sd128;
             else                      o_n[c4*8 +: 8] = rnd[7:0];

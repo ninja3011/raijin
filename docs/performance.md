@@ -54,7 +54,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 
 | # | Feature | Status | Measured effect |
 | --- | --- | --- | --- |
-| 1 | Timing closure: four copies each of 1/l and the output shift amount (`rtl/raijin_dupreg.v`) | RTL merged; layout running | Cycles unchanged (357). The clock target is 50 MHz, which would give 2.29 GOPS (estimate) |
+| 1 | Timing closure: four copies each of 1/l and the output shift amount (`rtl/raijin_dupreg.v`), then a carry-free output rounding (1b) | Layout `sram_p2_dupreg` done; 1b in RTL | Typical-corner fmax 42.1 → **44.8 MHz** (WNS −3.75 → −2.34 ns, TNS 4.7× smaller), standard-cell area −5.8%, wirelength −20%, 36.5 mW, LVS clean. 1b removes the 39-bit rounding carry chain that is now the worst path |
 | 2 | Group pipelining in the fused dataflow | RTL merged | Fused pass 357 → **173** cycles at P = 2 (2.06×, 74% utilization) and 197 → **111** at P = 4 (1.77×). That is 3.9 GOPS at 42 MHz, or 4.7 GOPS at 50 MHz. Unfused and decode are unchanged |
 | 3 | Causal prefill (CTRL bit 5) | RTL merged | One causal fused pass: **153** cycles at P = 2 and **97** at P = 4. Building the same outputs from 16 decode steps takes about 650 cycles at P = 2 and 680 at P = 4, so prefill is 4.2× to 7× faster, before counting the host traffic each decode step needs |
 | 4 | Multi-query decode: GQA/MQA and speculative verify (CTRL bits 6, 7) | RTL merged | One step serves P query rows at LEN = 16: **49** cycles for 2 rows at P = 2, against 96 for 2 single steps (1.96×), and **53** cycles for 4 rows at P = 4, against 200 (3.77×). Decode throughput per cycle scales with P |
@@ -79,6 +79,38 @@ copies from `sky130_fd_sc_hd__dfxtp_1` instances. `opt_merge` only merges
 built-in cell types, so those copies survive. A synthesis check of
 `raijin_out` keeps all 24 shift-amount flops. Simulation uses a behavioural
 register instead. Latency is unchanged, and every test is still bit-exact.
+
+**Layout result** (`sram_p2_dupreg`, commit c14a7a8, 20 ns clock):
+
+| Metric | sram_p2_v2 | sram_p2_dupreg |
+| --- | --- | --- |
+| Setup WNS / TNS, tt | −3.75 / −421 ns | **−2.34 / −89.5 ns** |
+| Setup WNS / TNS, ff | +5.20 / 0 | +6.93 / 0 |
+| Setup WNS / TNS, ss | −28.8 / −16,239 ns | −26.7 / −11,405 ns |
+| Failing setup endpoints, tt | 211 | 70 |
+| Hold violations | 93 | 81, all at ss (WNS −1.03 ns) |
+| Route DRC / antenna / LVS | 0 / 0 / clean | 0 / 0 / clean |
+| Power, tt | 36.9 mW | 36.5 mW |
+| Standard-cell area | 1.037 mm² | 0.977 mm² |
+| Wirelength | 7.84 m | 6.28 m |
+
+fmax at the typical corner rises from about 42.1 to about 44.8 MHz. The 1/l
+broadcast no longer appears among the worst paths. (The Magic DRC count of
+11.3 M is identical to v2, and every one of those errors is inside the
+OpenRAM macros.)
+
+**1b. Carry-free output rounding.** The five worst remaining paths all start
+at a shift-amount copy and end at an O-row flop. They pass through about
+1.9 ns of fanout buffers, then the stage-3 rounding add (y + 2^(sh−1)) >>> sh,
+which synthesised as a 39-bit ripple-carry chain (62 maj3 cells). For a floor
+shift,
+
+(y + 2^(sh−1)) >>> sh = (y >>> sh) + y[sh−1],
+
+so the add becomes a barrel shift and a one-bit increment ahead of the 8-bit
+saturation, with the same bits out. `raijin_out` now uses that form. The
+block and core suites are unchanged and bit-exact; the next layout,
+`sram_p2_speed`, will measure the gain.
 
 ### 2. Group pipelining
 
