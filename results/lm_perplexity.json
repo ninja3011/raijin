@@ -78,5 +78,21 @@
   "acc": 0.535888671875,
   "zero_p": 0.1549287275834517,
   "acc_overflow": 0
+ },
+ {
+  "variant": "Raijin K INT8, V INT4, SKIPTHR=6",
+  "loss": 1.5382462739944458,
+  "ppl": 4.656417026634997,
+  "acc": 0.5416259765625,
+  "zero_p": 0.2460451993075284,
+  "acc_overflow": 0
+ },
+ {
+  "variant": "Raijin operating point: MF2, K8 V4, SKIPTHR=6",
+  "loss": 1.5395479202270508,
+  "ppl": 4.662481980671127,
+  "acc": 0.5419921875,
+  "zero_p": 0.24607733524206912,
+  "acc_overflow": 0
  }
 ]

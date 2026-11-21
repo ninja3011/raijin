@@ -193,6 +193,8 @@ def evaluate(n_seq=256):
         ("Raijin K INT8, V INT4", rm.MODE_EXACT, dict(vbits=4)),
         ("Raijin K INT4, V INT4", rm.MODE_EXACT, dict(kbits=4, vbits=4)),
         ("Raijin INT4 + INT8 sink & worst page", rm.MODE_EXACT, dict(kbits=4, vbits=4, int8_pages=sink_and_worst)),
+        ("Raijin K INT8, V INT4, SKIPTHR=6", rm.MODE_EXACT, dict(vbits=4, thr=6)),
+        ("Raijin operating point: MF2, K8 V4, SKIPTHR=6", rm.MODE_MF2, dict(vbits=4, thr=6)),
     ]
     res = []
     with torch.no_grad():

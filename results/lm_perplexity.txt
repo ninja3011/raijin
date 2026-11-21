@@ -9,3 +9,5 @@ Raijin MXINT8, key skip SKIPTHR=2        ppl=4.7445 (+2.63%) top1=0.5386 zero-we
 Raijin K INT8, V INT4                    ppl=4.6533 (+0.65%) top1=0.5433 zero-weight keys=15.0%
 Raijin K INT4, V INT4                    ppl=4.8043 (+3.92%) top1=0.5343 zero-weight keys=15.8%
 Raijin INT4 + INT8 sink & worst page     ppl=4.7324 (+2.36%) top1=0.5359 zero-weight keys=15.5%
+Raijin K INT8, V INT4, SKIPTHR=6         ppl=4.6564 (+0.72%) top1=0.5416 zero-weight keys=24.6%
+Raijin operating point: MF2, K8 V4, SKIPTHR=6 ppl=4.6625 (+0.85%) top1=0.5420 zero-weight keys=24.6%

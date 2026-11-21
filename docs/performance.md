@@ -760,12 +760,14 @@ cosine against FP32 causal attention, `results/mixed_kv_N16_D16.txt`):
 | K INT8, V INT4 | 4.6533 | +0.65% | 54.33% | 15.0% |
 | K INT4, V INT4 | 4.8043 | +3.92% | 53.43% | 15.8% |
 | INT4 with INT8 sink and worst page (feature 14) | 4.7324 | +2.36% | 53.59% | 15.5% |
+| K INT8, V INT4, SKIPTHR = 6 | 4.6564 | +0.72% | 54.16% | 24.6% |
+| **Operating point: MF2, K INT8, V INT4, SKIPTHR = 6** | **4.6625** | **+0.85%** | 54.20% | 24.6% |
 
 What this shows:
 - The chip's arithmetic (MXINT8 operands, base-2 online softmax with the two-shift exponent and the chip's reciprocal) costs 0.19% perplexity in a real model. That is within the noise of retraining.
 - Key skip at SKIPTHR = 6 is free (+0.17%, within 0.02% of no skip) and zeroes a quarter of the keys, so their V reads are gated off. SKIPTHR = 4 still costs only 0.33% and skips 38%. SKIPTHR = 2 is too aggressive.
 - V is much more tolerant of INT4 than K: K8/V4 costs 0.65%, K4/V4 costs 3.9%. Keeping the sink page and the worst page in INT8 (feature 14) recovers 40% of the INT4 loss for the cost of two INT8 pages, so per-page precision is worth its hardware.
-- Recommended operating point for edge decode: MF2, SKIPTHR = 6, K INT8 / V INT4. Expected cost under 1% perplexity with half the V storage and a quarter fewer V reads.
+- Recommended operating point for edge decode: MF2, SKIPTHR = 6, K INT8 / V INT4. Measured together, the cost is +0.85% perplexity for half the V storage and a quarter fewer V reads. (Rows other than the MF1/MF2 ones use the exact exponent, 4.6300, as their reference.)
 
 ## Analytical scaling model
 
@@ -799,3 +801,28 @@ OpenROAD's power report at tt (vectorless, nominal SPEF), in mW:
 | Total | 32.3 | 84.9 |
 
 The 3.4x jump is an artefact of vectorless activity, not a real cost. The SRAM data outputs are black boxes with activity 0, so in dupreg the whole datapath behind them looks idle (about 0.005 toggles per cycle), which understates power. In the speed run the datapath is driven from propagated flop sources instead (about 0.76 toggles per cycle, more than real MXINT8 data would toggle), which overstates it. Setting activity on the black-box pins had no effect. Neither number should be quoted. The fix in progress is to annotate activity from a gate-level simulation of a fused pass (VCD or SAIF read with `read_vcd`/`read_saif`) and report power again for both runs. Scripts: `openlane/pw.tcl`, `openlane/pw5.tcl`.
+
+## Ablation on an edge-LLM attention layer
+
+`eval/ablation.py` (output `results/ablation.txt`) adds Raijin's features one at a time to one attention layer of a small edge LLM: 8 query heads sharing 2 KV heads (GQA 4:1), d = 64, a 512-token prompt and 512 generated tokens, P = 4 at 45 MHz. Cycles come from the validated scaling model, perplexity from the transformer evaluation above.
+
+| Configuration | Prefill | Decode | Tokens/s | KV bytes per token per head | V-row reads per token | Perplexity |
+|---|---|---|---|---|---|---|
+| Baseline (sram-kv) | 96.5 ms | 24,832 cycles | 1,812 | 136 | 6,140 | 4.6300 |
+| + group pipelining (2) | 96.5 ms | 24,832 | 1,812 | 136 | 6,140 | 4.6300 |
+| + causal prefill (3) | **23.5 ms** | 24,832 | 1,812 | 136 | 6,140 | 4.6300 |
+| + GQA decode (4) | 23.5 ms | **6,214** | **7,242** | 136 | **1,535** | 4.6300 |
+| + INT4 V cache (6) | 23.5 ms | 6,214 | 7,242 | **104** | 1,535 | 4.6533 |
+| + key skip, SKIPTHR = 6 (8) | 23.5 ms | 6,214 | 7,242 | 104 | **1,156** | 4.6564 |
+| + MF2 exponent | 23.5 ms | 6,214 | 7,242 | 104 | 1,156 | 4.6625 |
+
+Overall: prefill 4.1x faster, decode 4.0x faster, KV storage 1.31x smaller, V reads 5.3x fewer, for +0.85% perplexity against FP32 attention.
+
+What the ablation says about each feature:
+- **Causal prefill** is the biggest prefill win: without it a causal prompt has to be built from one decode step per token.
+- **GQA decode** is the biggest decode win, and it is free in accuracy: four query heads share one pass over their KV head, so decode time and KV reads drop by the group size.
+- **Group pipelining** matters for short passes (1.73x at N = 16) but fades for long ones (1.02x at N = 512), because its saving is a fixed per-group tail that long streams amortise anyway. It does not affect a causal or decode workload. It is still worth keeping for encoder-style batches and short prompts, but the ablation shows it is not where the LLM speed-up comes from.
+- **INT4 V and key skip** do not change cycles; they cut storage and memory traffic, which is where decode energy goes. Each costs well under 1% perplexity.
+- The host-link features (QSPI and the token window, 11 to 13) set the end-to-end rate when the chip is driven over SPI: 7,400 to 27,700 tokens/s at N = 16.
+
+Pipelining on a full fused pass, one head, P = 4: N = 16, d = 16: 192 → 111 cycles (the RTL measured 197 → 111); N = 64, d = 64: 4,608 → 4,143; N = 512, d = 64: 266,240 → 262,191.
