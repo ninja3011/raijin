@@ -62,6 +62,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 | 7 | Streaming KV cache with attention sinks (StreamingLLM) | Test and host policy, no RTL change | Generation runs past the 16-row cache. Over 48 tokens with 4 sinks, every step is bit-exact; mean cosine vs FP32 is 0.99983 overall and 0.99979 for tokens past the cache size |
 | 8 | Hardware key skip and V-read gating (SKIPTHR 0x5013, VSKIPS 0x5014) | RTL merged | Cycles unchanged; this is an energy feature. With the gate alone (SKIPTHR = 0), a fused pass on sharp attention skips 15 of 64 V-row reads (23%), and 10 of 64 (16%) on outlier-heavy data. SKIPTHR = 6 raises that to 25 of 64 (39%) with cosine 0.99984 against 0.99986. Lower thresholds save more but cost accuracy on flat attention |
 | 9 | RoPE on write (ROPE 0x5018, ROPEPOS 0x5019, `rtl/raijin_rope.v`) | RTL merged | No cycle or datapath-timing cost: rows are rotated on their way into SRAM. Bit-exact; mean cosine against FP32 RoPE attention is 0.9989 to 0.9999 across fused, unfused, causal and decode passes, including decode at absolute positions 200 to 215 |
+| 10 | Paged KV cache (PAGED 0x501A, PTAB 0x501C..F) | RTL merged | No cycle cost: the page table sits on the K and V read addresses. Two sequences share one cache and one prompt page, and a 32-token INT4 cache is scattered over a shuffled page order. Every decode step is bit-exact with decode on the gathered logical sequence |
 
 ### 1. Timing closure
 
@@ -398,4 +399,63 @@ elements back to INT8, and it is largest where a few large elements dominate
 a row. A wider rotated-row format, or per-row re-normalization after
 rotation, would recover it; the adaptive-precision feature is the natural
 place for that.
+
+### 10. Paged KV cache
+
+Until now, logical token j of the decode cache had to sit in physical row j.
+That works for one conversation, but a real serving stack shares cache
+memory between sequences, reuses common prompt prefixes, and evicts or
+reorders tokens. With a flat cache, each of those means copying 16-byte K and
+V rows over the slow host bus. vLLM's PagedAttention solved this for GPUs:
+the cache is split into fixed-size pages, and each sequence keeps a page
+table.
+
+**Hardware.** Pages hold 4 tokens, so the 2N = 32-token cache has 8 pages.
+PTAB has 8 entries of 3 bits, packed two per byte at 0x501C..F. With PAGED
+bit 0 set, a decode step maps every logical key index j to a physical token:
+
+`phys(j) = PTAB[j >> 2] · 4 + (j & 3)`
+
+The physical token is used for:
+- the K read address (`AK + phys`, or `phys >> 1` for an MXINT4 K region) and
+  the K nibble half;
+- the V read address and nibble half, and the V row's dv shift;
+- the e_k lookup for the score requant;
+- the e_vmax tree. It now spans the physical tokens that hold logical tokens
+  0..LEN−1 (a 32 × 8 match against the table). So a sequence's output scale
+  ignores pages that belong to other sequences.
+
+Masks and the causal, multi-query and speculative logic all keep using
+logical indices, so they are unchanged. The mapping is one 3-bit mux in front
+of each address, and a pass takes exactly the same cycles. The cost is 24
+flops for the table and the e_vmax valid mask (*estimate*: a few hundred
+cells).
+
+**What the host can now do without moving a row:**
+- **Several sequences in one cache.** Each sequence has its own page list,
+  and the host writes PTAB (four bytes) before each step.
+- **Prefix sharing.** Pages holding a common system prompt appear in every
+  sequence's table. They are written once.
+- **Eviction and reordering.** Retiring a page or splicing in a different one
+  is a table write. Combined with attention sinks (feature 7), a sink page can
+  stay pinned while ring pages are reassigned.
+- Works with the MXINT4 cache (feature 6) and with RoPE positions set through
+  ROPEPOS (feature 9).
+
+**Verification** (`test_paged_kv_cache`, `results/paged_N16_D16.txt`):
+- Two INT8 sequences share prompt page 0. Sequence A owns physical pages 2 and
+  3, and sequence B owns page 1. The pages are allocated interleaved, as
+  tokens arrive. Generation alternates between A (12 tokens) and B (8 tokens).
+- A 32-token MXINT4 cache is written through the shuffled page order
+  [3, 6, 7, 0, 5, 4, 1, 2].
+- Every decode step matches the model run on the gathered logical sequence,
+  outputs and exponents bit for bit. The mean cosine against FP32 causal
+  attention is 0.99986 (A), 0.99980 (B) and 0.97689 (INT4, as in feature 6).
+- Measured step times at P = 4 are 46 cycles at LEN = 8 and 66 cycles at
+  LEN = 32. The mapping is combinational on the address, so the controller
+  schedule, and therefore the cycle count, is the same as for a flat cache.
+
+Paging only applies to decode steps. Prefill and full passes read the
+regions in order, and the host can lay those out with the identity table
+(the reset value).
 

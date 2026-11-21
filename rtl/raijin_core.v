@@ -75,6 +75,11 @@
 //                  byte. Rows keep their exponent. Not applied to an MXINT4 K
 //                  region.
 //   0x5019  ROPEPOS position used when ROPE bit1 is set
+//   0x501A  PAGED  bit0: decode reads the KV cache through the page table
+//   0x501C..F PTAB page table, 2N/4 entries of 4 tokens each, entry 2b in the
+//                  low nibble of byte b: logical page -> physical page. Logical
+//                  token j lives in physical token PTAB[j/4]*4 + j%4 (its K/V
+//                  row and its e_k / e_v). Resets to the identity map.
 //   e_k / e_v exponents: 0x41tt / 0x42tt for tokens t = 0..2N-1
 `default_nettype none
 `ifdef RAIJIN_SKY130_SRAM
@@ -162,6 +167,18 @@ module raijin_core #(
     reg  [31:0]       vskips;         // V reads saved
     reg               rope_en, rope_abs;  // ROPE
     reg  [7:0]        ropepos;        // ROPEPOS
+    localparam        LPG = 2;                    // 4 tokens per page
+    localparam        NPG = NK >> LPG;            // pages in the cache
+    reg               paged;                      // PAGED
+    reg  [LK-LPG-1:0] ptab [0:NPG-1];             // PTAB
+    wire              pg_on = paged && decode;
+    // logical token -> physical token (identity unless paged decode)
+    function [LK-1:0] pmap;
+        input [LK-1:0] lj;
+        begin
+            pmap = pg_on ? {ptab[lj[LK-1:LPG]], lj[LPG-1:0]} : lj;
+        end
+    endfunction
     reg [LN-1:0]      qrow;
     reg [31:0]        cycles, skips;
     assign busy = busy_r;
@@ -279,7 +296,7 @@ module raijin_core #(
         p1_addr = 8'd0;
         if (k_rd) begin
             p1_csb  = {NB{1'b0}};
-            p1_addr = AK + (k4 ? (j >> 1) : j);
+            p1_addr = AK + (k4 ? (pmap(j) >> 1) : pmap(j));
         end else if (q_rd) begin
             p1_csb  = {NB{1'b0}};
             p1_addr = AQ + g * P + qcnt;
@@ -313,6 +330,7 @@ module raijin_core #(
     end
     wire [LG-1:0] g_d2 = tag_d2[LK +: LG];
     wire [LK-1:0] j_d2 = tag_d2[LK-1:0];
+    wire [LK-1:0] pj_d2 = pmap(j_d2);     // physical token of the K row in d1_r
 
     // MXINT4 K/V: pick token t's half of the SRAM word and widen each nibble
     // to INT8 as x4 << 4 (the host's e_k / e_v account for the 4-bit shift)
@@ -325,7 +343,7 @@ module raijin_core #(
                 unpack4[c*8 +: 8] = {w[(hi ? 64 : 0) + c*4 +: 4], 4'd0};
         end
     endfunction
-    wire [D*8-1:0] k_row = k4 ? unpack4(d1_r, j_d2[0]) : d1_r;
+    wire [D*8-1:0] k_row = k4 ? unpack4(d1_r, pj_d2[0]) : d1_r;
 
     integer qi;
     always @(posedge clk) begin
@@ -351,9 +369,16 @@ module raijin_core #(
     reg [4:0] dvr [0:NK-1];
     integer ei, ew, di;
     reg [NK*8-1:0] mt;    // pairwise max tree over every cache row
+    reg [NK-1:0]   pvalid;  // paged decode: physical tokens holding logical j < LEN
+    integer pl, pt;
     always @(*) begin
+        pvalid = {NK{1'b0}};
+        for (pl = 0; pl < NPG; pl = pl + 1)
+            for (pt = 0; pt < (1 << LPG); pt = pt + 1)
+                if (pl * (1 << LPG) + pt < len)
+                    pvalid[ptab[pl] * (1 << LPG) + pt] = 1'b1;
         for (ei = 0; ei < NK; ei = ei + 1)
-            mt[ei*8 +: 8] = (decode ? (ei < len) : (ei < N)) ? evm[ei] : 8'd0;
+            mt[ei*8 +: 8] = (decode ? (pg_on ? pvalid[ei] : (ei < len)) : (ei < N)) ? evm[ei] : 8'd0;
         for (ew = NK / 2; ew >= 1; ew = ew / 2)
             for (ei = 0; ei < ew; ei = ei + 1)
                 mt[ei*8 +: 8] = (mt[(2*ei)*8 +: 8] > mt[(2*ei+1)*8 +: 8]) ?
@@ -384,7 +409,7 @@ module raijin_core #(
             raijin_dpu #(.D(D), .TW(TW)) u_dpu (
                 .clk(clk), .rst_n(rst_n),
                 .in_valid(k_d2), .in_tag(tag_d2),
-                .a(qreg[gr]), .b(k_row), .ea(eqm[qr]), .eb(ekm[j_d2]),
+                .a(qreg[gr]), .b(k_row), .ea(eqm[qr]), .eb(ekm[pj_d2]),
                 .out_valid(dpu_valid[gr]), .out_tag(dpu_tag[gr*TW +: TW]),
                 .dot(dpu_dot[gr*20 +: 20]), .esum(dpu_esum[gr*9 +: 9])
             );
@@ -531,7 +556,7 @@ module raijin_core #(
         ag1 <= sm_otag[LK +: LG];  ag2 <= ag1;  ag3 <= ag2;  ag4 <= ag3;
     end
     always @(posedge clk) begin
-        aj1 <= acc_j;      aj2 <= aj1;
+        aj1 <= pmap(acc_j); aj2 <= aj1;   // physical token: V nibble half, dv
         ap1 <= acc_p;      ap2 <= ap1;
         asa1 <= acc_sa;    asa2 <= asa1;
         asb1 <= acc_sb;    asb2 <= asb1;
@@ -683,7 +708,7 @@ module raijin_core #(
             p0_din  = (pipe && !oq_byp) ? oq_row[oq_rp] : o_row;
         end else if (v_rd) begin
             p0_csb  = {NB{1'b0}};
-            p0_addr = AV + (v4 ? (acc_j >> 1) : acc_j);
+            p0_addr = AV + (v4 ? (pmap(acc_j) >> 1) : pmap(acc_j));
         end else if (sb_we) begin
             for (mb = 0; mb < NSB; mb = mb + 1) begin
                 p0_csb[mb] = 1'b0;
@@ -771,6 +796,10 @@ module raijin_core #(
                               5'h17: rd_reg <= vskips[31:24];
                               5'h18: rd_reg <= {6'd0, rope_abs, rope_en};
                               5'h19: rd_reg <= ropepos;
+                              5'h1A: rd_reg <= {7'd0, paged};
+                              5'h1C, 5'h1D, 5'h1E, 5'h1F:
+                                  rd_reg <= {{(4-(LK-LPG)){1'b0}}, ptab[{cidx[1:0], 1'b1}],
+                                             {(4-(LK-LPG)){1'b0}}, ptab[{cidx[1:0], 1'b0}]};
                               default: rd_reg <= 8'd0;
                           endcase
                     default: rd_reg <= 8'd0;
@@ -782,7 +811,7 @@ module raijin_core #(
     end
 
     // reciprocal results
-    integer ri;
+    integer ri, pi;
     always @(posedge clk) begin
         if (state == RCP_WAIT && sm_rvalid[0])
             for (ri = 0; ri < P; ri = ri + 1)
@@ -819,6 +848,8 @@ module raijin_core #(
             rope_en  <= 1'b0;
             rope_abs <= 1'b0;
             ropepos  <= 8'd0;
+            paged    <= 1'b0;
+            for (pi = 0; pi < NPG; pi = pi + 1) ptab[pi] <= pi;
             qrow   <= {LN{1'b0}};
             cycles <= 32'd0;
             skips  <= 32'd0;
@@ -841,6 +872,11 @@ module raijin_core #(
                     rope_abs <= wdata_r[1];
                 end
                 if (cidx == 5'h19) ropepos <= wdata_r;
+                if (cidx == 5'h1A) paged <= wdata_r[0];
+                if (cidx[4:2] == 3'b111) begin
+                    ptab[{cidx[1:0], 1'b0}] <= wdata_r[LK-LPG-1:0];
+                    ptab[{cidx[1:0], 1'b1}] <= wdata_r[4 +: LK-LPG];
+                end
                 if (cidx == 5'h12) begin
                     k4 <= wdata_r[0];
                     v4 <= wdata_r[1];

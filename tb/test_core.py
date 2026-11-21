@@ -563,3 +563,108 @@ async def test_rope(dut):
         dut._log.info(summary[-1])
     with open(os.path.join(os.path.dirname(__file__), "..", "results", f"rope_N{N}_D{D}.txt"), "w") as f:
         f.write(chr(10).join(summary) + chr(10))
+
+
+async def write_ptab(bus, ptab):
+    """PTAB (0x501C..F): 2N/4 entries, entry 2b in the low nibble of byte b."""
+    ent = list(ptab) + [0] * (2 * N // 4 - len(ptab))
+    for b in range(len(ent) // 2):
+        await bus.write(0x501C + b, ent[2 * b] | (ent[2 * b + 1] << 4))
+
+
+@cocotb.test()
+async def test_paged_kv_cache(dut):
+    """Paged KV cache (PAGED 0x501A, PTAB 0x501C): the decode step reads logical
+    token j from physical token PTAB[j/4]*4 + j%4. Two sequences share one
+    cache and one 4-token prompt page (prefix sharing), their pages are
+    interleaved as a page allocator would hand them out, and an MXINT4 cache of
+    2N tokens is scattered over a random page order. Every step is bit-exact
+    with decode on the logical (gathered) sequence."""
+    bus = await setup(dut)
+    rng = np.random.default_rng(int(os.environ.get("RAIJIN_SEED", 7)) + 53)
+    summary = []
+    await bus.write(0x501A, 1)
+    assert await bus.read(0x501A) == 1
+    # ---- two sequences, shared prompt page, INT8 ----
+    pf = 4
+    qf, kf, vf = rm.random_case(rng, n=pf + 8 + 4, d=D, scale=1.5)
+    q, eq, k, ek, v, ev = rm.prepare(qf, kf, vf)
+    seqs = {"A": list(range(pf)) + list(range(pf, pf + 8)),          # prompt + 8 own tokens
+            "B": list(range(pf)) + list(range(pf + 8, pf + 12))}     # prompt + 4 own tokens
+    ptabs = {"A": [0, 2, 3], "B": [0, 1]}        # logical page -> physical page
+    qrow_of = {"A": 12, "B": 13}
+
+    async def put_token(seq, t):
+        src = seqs[seq][t]
+        phys = ptabs[seq][t // 4] * 4 + t % 4
+        for base, mat in ((0x1000, k), (0x2000, v)):
+            for c in range(D):
+                await bus.write(base + phys * D + c, int(mat[src][c]))
+        await bus.write(0x4100 + phys, int(ek[src]))
+        await bus.write(0x4200 + phys, int(ev[src]))
+
+    async def step(seq, t, fmt="int8", arrays=None):
+        qa, eqa, ka, eka, va, eva = arrays
+        qr = qrow_of[seq] if fmt == "int8" else t % N
+        src = seqs[seq][t]
+        for c in range(D):
+            await bus.write(qr * D + c, int(qa[src][c]))
+        await bus.write(0x4000 + qr, int(eqa[src]))
+        await write_ptab(bus, ptabs[seq])
+        await bus.write(0x5010, t + 1)
+        await bus.write(0x5011, qr)
+        await bus.write(0x5000, 1 | (1 << 4))
+        await wait_done(dut)
+        o, eo, cycles, _ = await read_out(bus, rows=[qr])
+        idx = seqs[seq][:t + 1]
+        exp = rm.attention_decode(qa[idx], eqa[idx], ka[idx], eka[idx], va[idx], eva[idx],
+                                  qrow=t, length=t + 1)
+        assert np.array_equal(o[qr], exp.o[0]) and eo[qr] == exp.eo[0], \
+            f"paged {fmt} {seq} t={t}: rtl={o[qr]} e={eo[qr]} model={exp.o[0]} e={exp.eo[0]}"
+        return rm.mx_dequantize(o[qr:qr + 1], eo[qr:qr + 1])[0], cycles
+
+    for t in range(pf):                      # the shared prompt, written once
+        await put_token("A", t)
+    coss = {"A": [], "B": []}
+    refs = {s: rm.reference_causal(qf[seqs[s]], kf[seqs[s]], vf[seqs[s]]) for s in seqs}
+    order = []
+    for i in range(8):                       # interleaved generation
+        order.append(("A", pf + i))
+        if i < 4:
+            order.append(("B", pf + i))
+    for seq, t in order:
+        await put_token(seq, t)
+        got, cycles = await step(seq, t, arrays=(q, eq, k, ek, v, ev))
+        r = refs[seq][t]
+        coss[seq].append(float(np.dot(got, r) / np.linalg.norm(got) / np.linalg.norm(r)))
+    for s in seqs:
+        summary.append(f"paged int8 seq {s}: {len(seqs[s])} tokens, pages {ptabs[s]}, "
+                       f"shared prompt page 0, last step {cycles} cycles, mean cos={np.mean(coss[s]):.5f}")
+        dut._log.info(summary[-1])
+    # ---- MXINT4 cache of 2N tokens over a shuffled page order ----
+    await bus.write(0x5012, 3)
+    T = 2 * N
+    qf, kf, vf = rm.random_case(rng, n=T, d=D, scale=1.5)
+    arr4 = rm.prepare_kv4(qf, kf, vf)
+    q4, eq4, k4, ek4, v4, ev4 = arr4
+    perm = [int(x) for x in rng.permutation(T // 4)]
+    seqs["C"], ptabs["C"] = list(range(T)), perm
+    ref = rm.reference_causal(qf, kf, vf)
+    cos4 = []
+    for t in range(T):
+        phys = perm[t // 4] * 4 + t % 4
+        for base, mat in ((0x1000, k4), (0x2000, v4)):
+            for b, byte in enumerate(rm.pack4(mat[t])):
+                await bus.write(base + 8 * phys + b, byte)
+        await bus.write(0x4100 + phys, int(ek4[t]))
+        await bus.write(0x4200 + phys, int(ev4[t]))
+        got, cycles = await step("C", t, fmt="int4", arrays=arr4)
+        cos4.append(float(np.dot(got, ref[t]) / np.linalg.norm(got) / np.linalg.norm(ref[t])))
+    summary.append(f"paged int4: {T} tokens, page order {perm}, LEN={T} step {cycles} cycles, "
+                   f"mean cos={np.mean(cos4):.5f}")
+    dut._log.info(summary[-1])
+    await bus.write(0x5012, 0)
+    await bus.write(0x501A, 0)
+    await write_ptab(bus, list(range(2 * N // 4)))
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", f"paged_N{N}_D{D}.txt"), "w") as f:
+        f.write(chr(10).join(summary) + chr(10))
