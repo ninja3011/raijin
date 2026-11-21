@@ -852,3 +852,35 @@ async def test_lm_head(dut):
     dut._log.info(lines[0])
     with open(os.path.join(os.path.dirname(__file__), "..", "results", "lm_head_rtl.txt"), "w") as f:
         f.write(chr(10).join(lines) + chr(10))
+
+
+@cocotb.test(skip=os.environ.get("COCOTB_TEST_FILTER") != "test_gl_short")
+async def test_gl_short(dut):
+    """Short workload for gate-level power: one load, one fused pass, one
+    decode step. Logs the simulated window of each phase in ns and cycles."""
+    from cocotb.utils import get_sim_time
+    bus = await setup(dut)
+    rng = np.random.default_rng(5)
+    qf, kf, vf = rm.random_case(rng, n=N, d=D, scale=1.5)
+    args = rm.prepare(qf, kf, vf)
+    t0 = get_sim_time("ns")
+    await load(bus, *args)
+    t1 = get_sim_time("ns")
+    exp = rm.attention(*args, fused=True, mode=rm.MODE_EXACT)
+    o, eo, cycles, _ = await run_pass(bus, True, rm.MODE_EXACT)
+    t2 = get_sim_time("ns")
+    assert np.array_equal(o, exp.o) and np.array_equal(eo, exp.eo), "fused pass mismatch"
+    await bus.write(0x5010, N)
+    await bus.write(0x5011, N - 1)
+    await bus.write(0x5000, 1 | (1 << 4))
+    await wait_done(dut)
+    o2, eo2, dcycles, _ = await read_out(bus, rows=[N - 1])
+    t3 = get_sim_time("ns")
+    dec = rm.attention_decode(*args, qrow=N - 1, length=N, mode=rm.MODE_EXACT)
+    assert np.array_equal(o2[N - 1], dec.o[0]) and eo2[N - 1] == dec.eo[0], "decode mismatch"
+    msg = (f"GL window: load {t0:.0f}-{t1:.0f} ns, fused pass + readback {t1:.0f}-{t2:.0f} ns "
+           f"({cycles} busy cycles), decode + readback {t2:.0f}-{t3:.0f} ns ({dcycles} busy cycles); "
+           f"total {t3:.0f} ns = {t3 / 20:.0f} clock cycles")
+    dut._log.info(msg)
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", "gl_window.txt"), "w") as f:
+        f.write(msg + chr(10))

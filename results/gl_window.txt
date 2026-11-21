@@ -1,0 +1,1 @@
+GL window: load 80-16400 ns, fused pass + readback 16400-42340 ns (173 busy cycles), decode + readback 42340-45400 ns (48 busy cycles); total 45400 ns = 2270 clock cycles
