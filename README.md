@@ -10,7 +10,7 @@ unit. One controller runs attention two ways on the same hardware:
 
 A causal flag (CTRL bit 5) makes the fused pass causal, for prompt prefill in
 decoder models. Fused query groups are pipelined back to back
-(`docs/performance.md`).
+(`docs/performance.md` (and `docs/comparison.md` for prior work)).
 
 A third mode, decode, is one KV-cache step of autoregressive generation: one
 query row attends to the LEN keys and values already held in SRAM.
@@ -26,7 +26,7 @@ For LLM inference the core adds:
 - hardware key skip.
 
 The tapeout top level, `rtl/raijin_chip.v`, wraps the core with an SPI host
-port and idle clock gating. `docs/performance.md` documents each feature,
+port and idle clock gating. `docs/performance.md` (and `docs/comparison.md` for prior work) documents each feature,
 with measurements.
 
 The softmax-to-V path has an exact mode (16-entry LUT, 9×8 multipliers) and two
