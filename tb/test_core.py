@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "model"))
 import raijin_model as rm  # noqa: E402
 
 N = int(os.environ.get("RAIJIN_N", 16))
+P = int(os.environ.get("RAIJIN_P", 4))
 D = int(os.environ.get("RAIJIN_D", 16))
 RD_LATENCY = 3   # rdata is valid after the third rising edge following re
 
@@ -248,4 +249,49 @@ async def test_causal_prefill(dut):
         o, eo, _, _ = await run_pass(bus, True, rm.MODE_EXACT)
         assert np.array_equal(o, exp.o) and np.array_equal(eo, exp.eo), f"{name}: non-causal after causal"
     with open(os.path.join(os.path.dirname(__file__), "..", "results", f"causal_N{N}_D{D}.txt"), "w") as f:
+        f.write(chr(10).join(summary) + chr(10))
+
+
+@cocotb.test()
+async def test_multi_query_decode(dut):
+    """Multi-query decode: P query rows share one K/V stream in a single step.
+    GQA (every row sees all LEN keys) and speculative verify (row r sees keys
+    0..LEN-P+r), each bit-exact with the model, timed against P single-row steps."""
+    bus = await setup(dut)
+    rng = np.random.default_rng(int(os.environ.get("RAIJIN_SEED", 7)) + 23)
+    summary = []
+    for name, kw in CASES:
+        qf, kf, vf = rm.random_case(rng, n=N, d=D, **kw)
+        args = rm.prepare(qf, kf, vf)
+        await load(bus, *args)
+        q, eq, k, ek, v, ev = args
+        mode = rm.MODE_EXACT if name != "sharp" else rm.MODE_MF2
+        for spec in (False, True):
+            for length in sorted({P, N // 2, N}):
+                for group in (0, N // P - 1):
+                    await bus.write(0x5010, length)
+                    await bus.write(0x5011, group * P)
+                    ctrl = 1 | (mode << 2) | (1 << 4) | (1 << 6) | (int(spec) << 7)
+                    await bus.write(0x5000, ctrl)
+                    await wait_done(dut)
+                    rows = list(range(group * P, group * P + P))
+                    o, eo, cycles, skips = await read_out(bus, rows=rows)
+                    exp = rm.attention_decode_multi(q, eq, k, ek, v, ev, group=group, p=P,
+                                                    length=length, spec=spec, mode=mode)
+                    tag = f"{name} spec={int(spec)} len={length} group={group}"
+                    assert np.array_equal(o[rows], exp.o), f"{tag}: rtl=\n{o[rows]}\nmodel=\n{exp.o}"
+                    assert np.array_equal(eo[rows], exp.eo), f"{tag}: e rtl={eo[rows]} model={exp.eo}"
+                    assert skips == exp.skips, f"{tag}: skips rtl={skips} model={exp.skips}"
+                    if group == 0:
+                        # the same P outputs one row per step, for the speed comparison
+                        single = 0
+                        for r in rows:
+                            await bus.write(0x5010, length - P + 1 + (r - rows[0]) if spec else length)
+                            await bus.write(0x5011, r)
+                            await bus.write(0x5000, 1 | (mode << 2) | (1 << 4))
+                            await wait_done(dut)
+                            single += await bus.read32(0x5004)
+                        summary.append(f"{tag:36s} multi={cycles:3d} cycles  {P} single steps={single:4d} cycles")
+                        dut._log.info(summary[-1])
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", f"multi_decode_N{N}_D{D}.txt"), "w") as f:
         f.write(chr(10).join(summary) + chr(10))

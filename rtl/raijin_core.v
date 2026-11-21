@@ -19,6 +19,13 @@
 // last key, so short causal groups never overrun the reciprocal and output
 // stages of the group before them.
 //
+// Multi-query decode (CTRL bit 6 with decode): all P lanes of QROW's group
+// attend to the LEN cached keys in one step, sharing every K and V read. The P
+// query rows can be P heads of one grouped-query-attention group (GQA/MQA),
+// or P sequences that share a prompt. With bit 7 (speculative verify), lane r
+// sees keys 0..LEN-P+r: the P rows are P draft tokens whose K/V rows are the
+// last P cached rows, so one step scores a whole speculative draft.
+//
 // Storage: Q, K, V, O and the score buffer live in four 1 KB SRAM macros
 // (sky130_sram_1kbyte_1rw1r_32x256_8, one RW and one R port each). Bank b holds
 // bytes 4b..4b+3 of every row, so the four banks together return one full
@@ -43,7 +50,9 @@
 //   (offset = r * D + c)
 //   0x5000  CTRL   w: bit0 start, bit1 fused, bits3:2 mode (0 exact, 1 MF1, 2 MF2),
 //                     bit4 decode (implies the fused dataflow),
-//                     bit5 causal (fused, non-decode: row i sees keys 0..i)
+//                     bit5 causal (fused, non-decode: row i sees keys 0..i),
+//                     bit6 multi-query decode (all P rows of QROW's group),
+//                     bit7 speculative verify (multi, lane r sees keys 0..LEN-P+r)
 //   0x5001  OFFSET signed score requant offset
 //   0x5002  STATUS bit0 busy, bit1 done
 //   0x5003  RD_LATENCY (3)
@@ -126,7 +135,7 @@ module raijin_core #(
     // Control registers
     // ------------------------------------------------------------------
     reg               busy_r, done_r;
-    reg               fused, decode, causal;
+    reg               fused, decode, causal, multi, spec;
     reg [1:0]         mode;
     reg signed [7:0]  offset;
     reg [LN:0]        len;
@@ -378,7 +387,8 @@ module raijin_core #(
                 .s_valid(sm_valid), .s(s_in), .tag(sm_tag_in),
                 .m_update(sm_mupd), .emit(sm_emit),
                 .first(sm_first), .last(sm_last),
-                .mask(causal && (sm_j > sm_g * P + gr)),
+                .mask((causal && (sm_j > sm_g * P + gr)) ||
+                      (spec && ({1'b0, sm_j} + P > len + gr))),
                 .out_valid(sm_ovalid[gr]), .out_tag(sm_otag[gr*TW +: TW]),
                 .out_p(sm_p[gr*9 +: 9]), .out_sa(sm_sa[gr*4 +: 4]), .out_sb(sm_sb[gr*4 +: 4]),
                 .out_delta(sm_delta[gr*5 +: 5]),
@@ -444,7 +454,7 @@ module raijin_core #(
             end
         end
         for (ai = 0; ai < P; ai = ai + 1) begin
-            acc_lane[ai] = (!decode || (qlane == ai)) && !(fused && sm_omask[ai]);
+            acc_lane[ai] = (!decode || multi || (qlane == ai)) && !(fused && sm_omask[ai]);
             acc_en[ai]   = acc_valid && acc_lane[ai] && (acc_p[ai*9 +: 9] != 9'd0);
         end
     end
@@ -732,6 +742,8 @@ module raijin_core #(
             fused  <= 1'b0;
             decode <= 1'b0;
             causal <= 1'b0;
+            multi  <= 1'b0;
+            spec   <= 1'b0;
             since_last <= 5'd31;
             mode   <= 2'd0;
             offset <= 8'sd0;
@@ -764,6 +776,8 @@ module raijin_core #(
                         fused  <= wdata_r[1] | wdata_r[4];
                         decode <= wdata_r[4];
                         causal <= wdata_r[5] && wdata_r[1] && !wdata_r[4];
+                        multi  <= wdata_r[4] && (wdata_r[6] || wdata_r[7]);
+                        spec   <= wdata_r[4] && wdata_r[7];
                         since_last <= 5'd31;
                         mode   <= wdata_r[3:2];
                         busy_r <= 1'b1;
@@ -829,7 +843,7 @@ module raijin_core #(
                 RCP_WAIT: begin
                     if (sm_rvalid[0]) begin
                         if (fused) begin
-                            orow  <= decode ? qlane : {LP{1'b0}};
+                            orow  <= (decode && !multi) ? qlane : {LP{1'b0}};
                             state <= OUT_ISSUE;
                         end else if (last_g) begin
                             g <= 0;
@@ -860,7 +874,7 @@ module raijin_core #(
                 end
                 OUT_ISSUE: begin
                     orow <= orow + 1'b1;
-                    if (decode || orow == P - 1) begin
+                    if ((decode && !multi) || orow == P - 1) begin
                         if (decode || last_g) begin
                             dcnt  <= 4'd4;
                             state <= OUT_DRAIN;

@@ -204,7 +204,8 @@ def attention(q, eq, k, ek, v, ev, *, fused: bool, mode: int = MODE_EXACT,
 
 
 def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
-                     mode: int = MODE_EXACT, offset: int = 0) -> PassResult:
+                     mode: int = MODE_EXACT, offset: int = 0,
+                     emax_len: int | None = None) -> PassResult:
     """One KV-cache decode step: query row `qrow` attends to keys 0..length-1.
 
     This is the fused (online softmax) pass for one query over a key prefix.
@@ -214,7 +215,7 @@ def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
     q, k, v = (np.asarray(a, dtype=np.int64) for a in (q, k, v))
     eq, ek, ev = (np.asarray(a, dtype=np.int64) for a in (eq, ek, ev))
     d = q.shape[1]
-    emax = int(ev[:length].max())
+    emax = int(ev[:length if emax_len is None else emax_len].max())
     s = [requant(dpu(q[qrow], k[j]), int(eq[qrow]) + int(ek[j]), offset) for j in range(length)]
     acc = [0] * d
     lsum, m, skips = 0, M_INIT, 0
@@ -234,6 +235,29 @@ def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
     row, e = out_row(acc, recip(lsum), emax)
     return PassResult(o=np.array([row], dtype=np.int64), eo=np.array([e], dtype=np.int64),
                       skips=skips, l=[lsum])
+
+
+def attention_decode_multi(q, eq, k, ek, v, ev, *, group: int, p: int, length: int,
+                           spec: bool = False, mode: int = MODE_EXACT,
+                           offset: int = 0) -> PassResult:
+    """Multi-query decode step: the p query rows of `group` (rows group*p ..
+    group*p+p-1) attend to the cached keys in one step, as the RTL does.
+
+    GQA / MQA (spec=False): every row sees keys 0..length-1.
+    Speculative verify (spec=True): the rows are p draft tokens whose K/V are
+    the last p cached rows; row r sees keys 0..length-p+r.
+    e_vmax is over the length cached V rows for every row."""
+    rows, eos, ls, skips = [], [], [], 0
+    for r in range(p):
+        n_keys = length - p + r + 1 if spec else length
+        res = attention_decode(q, eq, k, ek, v, ev, qrow=group * p + r, length=n_keys,
+                               mode=mode, offset=offset, emax_len=length)
+        rows.append(res.o[0])
+        eos.append(res.eo[0])
+        ls += res.l
+        skips += res.skips
+    return PassResult(o=np.array(rows, dtype=np.int64), eo=np.array(eos, dtype=np.int64),
+                      skips=skips, l=ls)
 
 
 def _check_decode_matches_fused(rng) -> None:

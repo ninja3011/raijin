@@ -74,7 +74,7 @@ def main():
             run(top, "test_blocks", args.sim)
     if args.what in ("core", "all"):
         run("raijin_core", "test_core", args.sim, params={"N": args.n, "D": 16, "P": args.p},
-            extra_env={"RAIJIN_N": str(args.n), "RAIJIN_D": "16"}, macro=args.macro)
+            extra_env={"RAIJIN_N": str(args.n), "RAIJIN_D": "16", "RAIJIN_P": str(args.p)}, macro=args.macro)
     if args.what in ("uart", "all"):
         run("raijin_uart_tb_top", "test_uart", args.sim)
 

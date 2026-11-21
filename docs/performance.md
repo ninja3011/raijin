@@ -57,6 +57,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 | 1 | Timing closure: four copies each of 1/l and the output shift amount (`rtl/raijin_dupreg.v`) | RTL merged; layout running | Cycles unchanged (357). The clock target is 50 MHz, which would give 2.29 GOPS (estimate) |
 | 2 | Group pipelining in the fused dataflow | RTL merged | Fused pass 357 → **173** cycles at P = 2 (2.06×, 74% utilization) and 197 → **111** at P = 4 (1.77×). That is 3.9 GOPS at 42 MHz, or 4.7 GOPS at 50 MHz. Unfused and decode are unchanged |
 | 3 | Causal prefill (CTRL bit 5) | RTL merged | One causal fused pass: **153** cycles at P = 2 and **97** at P = 4. Building the same outputs from 16 decode steps takes about 650 cycles at P = 2 and 680 at P = 4, so prefill is 4.2× to 7× faster, before counting the host traffic each decode step needs |
+| 4 | Multi-query decode: GQA/MQA and speculative verify (CTRL bits 6, 7) | RTL merged | One step serves P query rows at LEN = 16: **49** cycles for 2 rows at P = 2, against 96 for 2 single steps (1.96×), and **53** cycles for 4 rows at P = 4, against 200 (3.77×). Decode throughput per cycle scales with P |
 
 ### 1. Timing closure
 
@@ -133,3 +134,33 @@ with outliers in the exact mode, and 0.9992 to 0.9999 in MF2 mode.
 The test `test_causal_prefill` covers three tensor families, all three exp
 modes and two requant offsets. It is bit-exact with the model, and it checks
 that a non-causal pass straight after a causal one is unaffected.
+
+### 4. Multi-query decode (GQA / MQA and speculative-decoding verification)
+
+A single-row decode step keeps only one of the P DPUs and accumulator rows
+busy, yet it pays for every K and V read. CTRL bit 6 (with decode) runs all P
+rows of QROW's group against the LEN cached keys in one step, so every K and
+V row read from SRAM is used P times. The datapath is unchanged; only the lane
+enables and the output issue differ.
+
+| Use | How the host lays it out | Mask |
+| --- | --- | --- |
+| Grouped-query / multi-query attention | The P query heads that share one KV head go in rows gP .. gP+P−1 | none: every row sees keys 0..LEN−1 |
+| Several sequences with one shared prompt (prefix sharing) | One query per sequence in rows gP .. gP+P−1 | none |
+| Speculative decoding verification (bit 7) | P draft tokens: their K/V are the last P cached rows, and their queries go in rows gP .. gP+P−1 | lane r sees keys 0..LEN−P+r (causal among the drafts) |
+
+Speculative decoding is how a small draft model's guesses get checked. With
+bit 7, Raijin scores a whole P-token draft in the time of one decode step.
+
+Measured at LEN = 16 (`results/multi_decode_N16_D16.txt`, P = 4 build):
+
+| Build | One multi-query step | The same rows as single steps | Speed-up |
+| --- | --- | --- | --- |
+| P = 2 | 49 cycles | 96 cycles | 1.96× |
+| P = 4 | 53 cycles | 200 cycles | 3.77× |
+
+The golden model is `attention_decode_multi`. e_vmax is taken over the LEN
+cached V rows for every row, as in a single-row step, so row r of a GQA step
+is bit-identical to a single-row step on that row. `test_multi_query_decode`
+covers GQA and speculative verify, three tensor families, LEN ∈ {P, N/2, N}
+and the first and last groups, all bit-exact.
