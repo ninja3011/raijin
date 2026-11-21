@@ -74,8 +74,17 @@ module raijin_chip #(
     assign gclk = clk & cg_l;
 `endif
 
+    // core reset: released again in step with gclk, so its recovery/removal
+    // checks are gclk-to-gclk and see no clk/gclk insertion skew. The gate is
+    // open throughout (hold reloads to HOLD in reset and counts 7 cycles after).
+    reg [1:0] crst_s;
+    always @(posedge gclk or negedge srst_n) begin
+        if (!srst_n) crst_s <= 2'b00;
+        else         crst_s <= {crst_s[0], 1'b1};
+    end
+
     raijin_core #(.N(N), .D(D), .P(P)) u_core (
-        .clk(gclk), .rst_n(srst_n), .addr(addr), .wdata(wdata), .we(we), .re(re),
+        .clk(gclk), .rst_n(crst_s[1]), .addr(addr), .wdata(wdata), .we(we), .re(re),
         .rdata(rdata), .busy(busy), .done(done));
 endmodule
 `default_nettype wire
