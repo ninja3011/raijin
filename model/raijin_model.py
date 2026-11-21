@@ -403,6 +403,57 @@ def reference_causal(qf, kf, vf):
     return p @ vf
 
 
+# ---------------------------------------------------------------------------
+# RoPE on write (feature 9)
+# ---------------------------------------------------------------------------
+# Pair i = elements (2i, 2i+1) turns by pos * theta_i, theta_i = 10000^(-2i/d).
+# Phase is in turns, Q0.20: ROPE_W[i] = round(2^20 * theta_i / (2 pi)).
+ROPE_W = [166886, 52774, 16689, 5277, 1669, 528, 167, 53]
+# quarter-wave sine, Q1.8: ROPE_SIN[k] = round(256 * sin(2 pi k / 1024)), k = 0..256
+ROPE_SIN = [int(round(256 * np.sin(2 * np.pi * k / 1024))) for k in range(257)]
+
+
+def rope_cs(pos: int, i: int) -> Tuple[int, int]:
+    """(cos, sin) in Q1.8 for pair i at position pos, as the RTL computes it."""
+    ph = (pos * ROPE_W[i]) & 0xFFFFF
+    a = ((ph + (1 << 9)) >> 10) & 1023          # 10-bit phase, rounded
+    q, k = a >> 8, a & 255
+    s0, c0 = ROPE_SIN[k], ROPE_SIN[256 - k]
+    return [(c0, s0), (-s0, c0), (-c0, -s0), (s0, -c0)][q]
+
+
+def rope_row(row: Sequence[int], pos: int) -> List[int]:
+    """Rotate one INT8 row as the write-path rotator does: round, then
+    saturate to INT8. The row keeps its exponent."""
+    out = []
+    for i in range(len(row) // 2):
+        x, y = int(row[2 * i]), int(row[2 * i + 1])
+        c, s = rope_cs(pos, i)
+        out += [_sat((x * c - y * s + 128) >> 8, 8), _sat((x * s + y * c + 128) >> 8, 8)]
+    return out
+
+
+def rope_float(x: np.ndarray, pos: Sequence[int]) -> np.ndarray:
+    """Exact (float) RoPE, interleaved pairs, for the FP32 reference."""
+    x = np.array(x, dtype=np.float64)
+    d = x.shape[1]
+    th = 10000.0 ** (-2 * np.arange(d // 2) / d)
+    for r, p in enumerate(pos):
+        a = p * th
+        c, s = np.cos(a), np.sin(a)
+        x0, x1 = x[r, 0::2].copy(), x[r, 1::2].copy()
+        x[r, 0::2] = x0 * c - x1 * s
+        x[r, 1::2] = x0 * s + x1 * c
+    return x
+
+
+def rope_quantized(m: np.ndarray, e: np.ndarray, pos: Sequence[int]):
+    """What the chip stores for rows written with RoPE on: rotated elements,
+    same exponents."""
+    out = np.array([rope_row(m[r], pos[r]) for r in range(m.shape[0])], dtype=np.int64)
+    return out, np.asarray(e, dtype=np.int64)
+
+
 def random_case(rng: np.random.Generator, n=16, d=16, scale=1.0, outliers=False):
     qf = rng.standard_normal((n, d)) * scale
     kf = rng.standard_normal((n, d)) * scale

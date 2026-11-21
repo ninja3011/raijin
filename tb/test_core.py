@@ -495,3 +495,71 @@ async def test_key_skip(dut):
     await bus.write(0x5013, 0)
     with open(os.path.join(os.path.dirname(__file__), "..", "results", f"keyskip_N{N}_D{D}.txt"), "w") as f:
         f.write(chr(10).join(summary) + chr(10))
+
+
+@cocotb.test()
+async def test_rope(dut):
+    """RoPE on write (ROPE 0x5018, ROPEPOS 0x5019): the host writes raw Q and K
+    rows and the chip rotates each pair on its way into SRAM. Passes are
+    bit-exact with the model of the rotator, and are compared with FP32 RoPE
+    attention. Decode uses absolute positions from ROPEPOS."""
+    bus = await setup(dut)
+    rng = np.random.default_rng(int(os.environ.get("RAIJIN_SEED", 7)) + 31)
+    summary = []
+    for name, kw in CASES:
+        qf, kf, vf = rm.random_case(rng, n=N, d=D, **kw)
+        q, eq, k, ek, v, ev = rm.prepare(qf, kf, vf)
+        pos = list(range(N))
+        qr, eqr = rm.rope_quantized(q, eq, pos)
+        kr, ekr = rm.rope_quantized(k, ek, pos)
+        await bus.write(0x5018, 1)
+        assert await bus.read(0x5018) == 1
+        await load(bus, q, eqr, k, ekr, v, ev)          # raw rows; the chip rotates
+        await bus.write(0x5018, 0)
+        qrf, krf = rm.rope_float(qf, pos), rm.rope_float(kf, pos)
+        for fused, causal in ((False, False), (True, False), (True, True)):
+            for mode in (rm.MODE_EXACT, rm.MODE_MF2):
+                exp = rm.attention(qr, eqr, kr, ekr, v, ev, fused=fused, mode=mode, causal=causal)
+                o, eo, cycles, skips = await run_pass(bus, fused, mode, causal=causal)
+                tag = f"rope {name} fused={int(fused)} causal={int(causal)} mode={mode}"
+                assert np.array_equal(o, exp.o), f"{tag}: output mismatch\nrtl=\n{o}\nmodel=\n{exp.o}"
+                assert np.array_equal(eo, exp.eo), f"{tag}: exponent mismatch"
+                assert skips == exp.skips, f"{tag}: skips"
+                ref = (rm.reference_causal if causal else rm.reference)(qrf, krf, vf)
+                got = rm.mx_dequantize(o, eo)
+                cos = float(np.mean([np.dot(got[i], ref[i]) / np.linalg.norm(got[i]) /
+                                     np.linalg.norm(ref[i]) for i in range(N)]))
+                if mode == rm.MODE_EXACT:
+                    summary.append(f"{tag:42s} cycles={cycles:4d} mean_row_cos={cos:.5f}")
+                    dut._log.info(summary[-1])
+        # decode at absolute positions 200 + t (ROPEPOS), one token at a time
+        base = 200
+        apos = [base + t for t in range(N)]
+        qa, eqa = rm.rope_quantized(q, eq, apos)
+        ka, eka = rm.rope_quantized(k, ek, apos)
+        refa = rm.reference_causal(rm.rope_float(qf, apos), rm.rope_float(kf, apos), vf)
+        coss = []
+        for t in range(N):
+            await bus.write(0x5018, 3)
+            await bus.write(0x5019, base + t)
+            for b, mat in ((0x0000, q), (0x1000, k)):
+                for c in range(D):
+                    await bus.write(b + t * D + c, int(mat[t][c]))
+            await bus.write(0x5018, 0)
+            for c in range(D):
+                await bus.write(0x2000 + t * D + c, int(v[t][c]))
+            for b, ex in ((0x4000, eqa), (0x4100, eka), (0x4200, ev)):
+                await bus.write(b + t, int(ex[t]))
+            await bus.write(0x5010, t + 1)
+            await bus.write(0x5011, t)
+            await bus.write(0x5000, 1 | (1 << 4))
+            await wait_done(dut)
+            o, eo, cycles, skips = await read_out(bus, rows=[t])
+            exp = rm.attention_decode(qa, eqa, ka, eka, v, ev, qrow=t, length=t + 1)
+            assert np.array_equal(o[t], exp.o[0]) and eo[t] == exp.eo[0], f"rope decode {name} t={t}"
+            got = rm.mx_dequantize(o[t:t + 1], eo[t:t + 1])[0]
+            coss.append(float(np.dot(got, refa[t]) / np.linalg.norm(got) / np.linalg.norm(refa[t])))
+        summary.append(f"rope {name} decode pos={base}..{base + N - 1}{'':14s} cycles={cycles:4d} mean_cos={np.mean(coss):.5f}")
+        dut._log.info(summary[-1])
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", f"rope_N{N}_D{D}.txt"), "w") as f:
+        f.write(chr(10).join(summary) + chr(10))

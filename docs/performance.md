@@ -61,6 +61,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 | 6 | MXINT4 KV cache (KVFMT 0x5012: bit 0 K, bit 1 V) | RTL merged | With K and V both INT4, the same SRAM holds **2N = 32 tokens** instead of 16, and every step is bit-exact. Accuracy cost is mean cosine 0.965 to 0.983 against 0.9996+ for INT8. V-only INT4 keeps 0.991 |
 | 7 | Streaming KV cache with attention sinks (StreamingLLM) | Test and host policy, no RTL change | Generation runs past the 16-row cache. Over 48 tokens with 4 sinks, every step is bit-exact; mean cosine vs FP32 is 0.99983 overall and 0.99979 for tokens past the cache size |
 | 8 | Hardware key skip and V-read gating (SKIPTHR 0x5013, VSKIPS 0x5014) | RTL merged | Cycles unchanged; this is an energy feature. With the gate alone (SKIPTHR = 0), a fused pass on sharp attention skips 15 of 64 V-row reads (23%), and 10 of 64 (16%) on outlier-heavy data. SKIPTHR = 6 raises that to 25 of 64 (39%) with cosine 0.99984 against 0.99986. Lower thresholds save more but cost accuracy on flat attention |
+| 9 | RoPE on write (ROPE 0x5018, ROPEPOS 0x5019, `rtl/raijin_rope.v`) | RTL merged | No cycle or datapath-timing cost: rows are rotated on their way into SRAM. Bit-exact; mean cosine against FP32 RoPE attention is 0.9989 to 0.9999 across fused, unfused, causal and decode passes, including decode at absolute positions 200 to 215 |
 
 ### 1. Timing closure
 
@@ -320,4 +321,76 @@ and P = 4.
 - Cycles are unchanged. Turning saved beats into saved cycles would mean
   compacting the key stream ahead of the accumulators. That is left for later,
   because it would break the fixed schedule that the O-write queue relies on.
+
+### 9. RoPE on write
+
+Rotary position embedding (RoPE) is the position scheme of almost every
+current decoder LLM, including LLaMA, Mistral, Qwen and Gemma. Q and K are
+rotated pairwise by an angle proportional to the token position before QKᵀ,
+so the score depends only on the relative position. On an edge system the
+host is a small MCU, and computing sin/cos for every element of every Q and
+K row is real work for it. Raijin now does the rotation itself.
+
+**Where.** Real models cache K after RoPE, so the right place to rotate is on
+the way into the KV cache, not on every read. With ROPE bit 0 set, writes to
+the Q and K regions go through `raijin_rope`. The host writes raw rows
+exactly as before.
+
+- An **even byte** (element 2i) is latched. In the same cycle, the phase
+  pos · ω_i is formed, and cos/sin come from a quarter-wave table. The phase
+  is in turns, Q0.20, rounded to 10 bits, and the table holds 256 Q1.8
+  entries.
+- An **odd byte** (element 2i+1) completes the pair. The rotated pair is
+  `x' = sat8((x·c − y·s + 128) >> 8)` and `y' = sat8((x·s + y·c + 128) >> 8)`.
+  It goes to SRAM as one two-byte write in place of the host's single-byte
+  write, so there is no queue, no extra cycle and no port conflict.
+- The position is the row index, or the ROPEPOS register when ROPE bit 1 is
+  set. ROPEPOS lets a streaming or paged cache place a token at its true
+  absolute position, which can be anywhere in 0..255.
+- Rows keep their MXINT8 exponent. A rotation preserves each pair's length,
+  so saturation clips only pairs whose length is above 127.
+
+The rotator is off the pass datapath entirely. The SRAM → DPU path, the one
+the timing work in feature 1 is fighting, is untouched. It costs four 8 × 10
+multipliers, one 8 × 18 phase multiplier, a 256-entry 9-bit table and about
+30 flops. That is roughly 2 to 3 k cells (*estimate*, before synthesis).
+
+**Conventions.**
+- Pairs are interleaved (2i, 2i+1), with θ_i = 10000^(−2i/16). Models trained
+  with the "half-split" layout (i, i + d/2) work unchanged after the same
+  column permutation is applied to the Q and K projection weights, because
+  QKᵀ is invariant to a shared permutation.
+- The host writes each pair's even byte before its odd byte (natural order).
+- RoPE does not apply to an MXINT4 K region.
+
+**Design choice, measured.** Before fixing the arithmetic, I swept four
+variants in the model over 24 random tensors. Each variant either halved the
+result (no saturation, exponent + 1) or saturated it (exponent unchanged),
+with Q1.7, Q1.8 or Q1.9 trig and 9 to 12 phase bits. Trig precision mattered
+more than the output format. The halved Q1.7 version lost up to 0.002
+cosine on outlier-heavy data. Saturating Q1.8 with a 10-bit phase was the
+best trade for its table size, and it keeps the host contract simple: no
+exponent adjustment.
+
+**Verification.**
+- `test_rope_rotator` (block level) compares the rotator with `rm.rope_row`
+  for every position 0..255 and every pair, with random and extreme values:
+  4,192 pairs.
+- `test_rope` (core) writes raw Q and K with ROPE on. It runs unfused, fused
+  and causal passes in exact and MF2 modes, plus a 16-token decode where each
+  token is written at absolute position 200 + t through ROPEPOS.
+- Everything is bit-exact with the model. The core suite passes 11/11 at
+  P = 2 and P = 4.
+
+**Accuracy** (P = 4, exact mode, mean row cosine against FP32 attention with
+exact float RoPE, `results/rope_N16_D16.txt`):
+
+| Family | Unfused | Fused | Causal | Decode, positions 200..215 |
+| --- | --- | --- | --- | --- |
+| random | 0.99983 | 0.99984 | 0.99990 | 0.99986 |
+| sharp | 0.99941 | 0.99946 | 0.99981 | 0.99823 |
+| outliers | 0.99893 | 0.99905 | 0.99921 | 0.99940 |
+
+The cost against the same passes without RoPE is at most about 0.0006 cosine
+on full passes. It comes from rounding the rotated elements back to INT8.
 

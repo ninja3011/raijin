@@ -69,6 +69,12 @@
 //                  powers of two below the running max are dropped (p = 0)
 //   0x5014..7 VSKIPS (little endian) V-row reads saved this pass: no lane
 //                  needed the V row, so it was never read
+//   0x5018  ROPE   bit0: rotate Q and K rows on write (RoPE, interleaved pairs,
+//                  theta_i = 10000^(-2i/16)); bit1: position = ROPEPOS instead
+//                  of the row index. Write each pair's even byte before its odd
+//                  byte. Rows keep their exponent. Not applied to an MXINT4 K
+//                  region.
+//   0x5019  ROPEPOS position used when ROPE bit1 is set
 //   e_k / e_v exponents: 0x41tt / 0x42tt for tokens t = 0..2N-1
 `default_nettype none
 `ifdef RAIJIN_SKY130_SRAM
@@ -154,6 +160,8 @@ module raijin_core #(
     reg               k4, v4;         // KVFMT: MXINT4 K (bit 0), V (bit 1)
     reg  [3:0]        thr;            // SKIPTHR
     reg  [31:0]       vskips;         // V reads saved
+    reg               rope_en, rope_abs;  // ROPE
+    reg  [7:0]        ropepos;        // ROPEPOS
     reg [LN-1:0]      qrow;
     reg [31:0]        cycles, skips;
     assign busy = busy_r;
@@ -180,6 +188,12 @@ module raijin_core #(
     wire          start_w    = we_r && creg && cidx == 5'h00 && wdata_r[0] && !busy_r;
     wire          bus_mem_we = we_r && !busy_r && region < 4'h3;
     wire          bus_mem_re = re_r && !busy_r && region == 4'h3;
+    // RoPE on write: pairs of Q / K bytes are rotated before they reach SRAM
+    wire          rope_hit   = bus_mem_we && rope_en && (region == 4'h0 || (region == 4'h1 && !k4));
+    wire [7:0]    rope_xo, rope_yo;
+    raijin_rope u_rope (.clk(clk), .we_even(rope_hit && !bcol[0]), .pair(bcol[3:1]),
+        .pos(rope_abs ? ropepos : {{(8-LN){1'b0}}, brow}), .wdata(wdata_r),
+        .xo(rope_xo), .yo(rope_yo));
 
     always @(posedge clk) begin
         if (we_r && !busy_r && region == 4'h4) begin
@@ -678,6 +692,16 @@ module raijin_core #(
             end
             p0_addr = AS + sb_wtag;
             p0_din  = sb_wdata;
+        end else if (rope_hit) begin
+            // the even byte only primes the rotator; the odd byte writes both
+            if (bcol[0]) begin
+                p0_csb[bbank] = 1'b0;
+                p0_web        = {NB{1'b0}};
+                p0_mask[bbank*4 + bbyte]       = 1'b1;
+                p0_mask[bbank*4 + bbyte - 1'b1] = 1'b1;
+            end
+            p0_addr = region[1:0] * N + brow;
+            p0_din  = {NB*2{rope_yo, rope_xo}};
         end else if (bus_mem_we) begin
             p0_csb[bbank] = 1'b0;
             p0_web        = {NB{1'b0}};
@@ -745,6 +769,8 @@ module raijin_core #(
                               5'h15: rd_reg <= vskips[15:8];
                               5'h16: rd_reg <= vskips[23:16];
                               5'h17: rd_reg <= vskips[31:24];
+                              5'h18: rd_reg <= {6'd0, rope_abs, rope_en};
+                              5'h19: rd_reg <= ropepos;
                               default: rd_reg <= 8'd0;
                           endcase
                     default: rd_reg <= 8'd0;
@@ -790,6 +816,9 @@ module raijin_core #(
             v4     <= 1'b0;
             thr    <= 4'd0;
             vskips <= 32'd0;
+            rope_en  <= 1'b0;
+            rope_abs <= 1'b0;
+            ropepos  <= 8'd0;
             qrow   <= {LN{1'b0}};
             cycles <= 32'd0;
             skips  <= 32'd0;
@@ -807,6 +836,11 @@ module raijin_core #(
                 if (cidx == 5'h01) offset <= wdata_r;
                 if (cidx == 5'h10) len    <= wdata_r[LK:0];
                 if (cidx == 5'h13) thr <= wdata_r[3:0];
+                if (cidx == 5'h18) begin
+                    rope_en  <= wdata_r[0];
+                    rope_abs <= wdata_r[1];
+                end
+                if (cidx == 5'h19) ropepos <= wdata_r;
                 if (cidx == 5'h12) begin
                     k4 <= wdata_r[0];
                     v4 <= wdata_r[1];

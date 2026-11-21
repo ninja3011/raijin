@@ -7,6 +7,7 @@
         "dir::../rtl/raijin_softmax_lane.v",
         "dir::../rtl/raijin_acc_array.v",
         "dir::../rtl/raijin_dupreg.v",
+        "dir::../rtl/raijin_rope.v",
         "dir::../rtl/raijin_out.v",
         "dir::../rtl/raijin_core.v"
     ],

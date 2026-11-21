@@ -189,3 +189,33 @@ async def test_lane_online_and_recip(dut):
             if int(dut.r_valid.value):
                 break
         assert int(dut.r.value) == rm.recip(lsum)
+
+
+@cocotb.test(skip=TOP != "raijin_rope")
+async def test_rope_rotator(dut):
+    """The RoPE rotator against rm.rope_row: every position 0..255, every pair,
+    random element values plus the extremes."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    dut.we_even.value = 0
+    await ClockCycles(dut.clk, 2)
+    rng = random.Random(5)
+    n = 0
+    for pos in range(256):
+        for pair in range(8):
+            xs = [(-128, -128), (127, -128), (127, 127)] if pos % 64 == 0 else []
+            xs += [(rng.randint(-128, 127), rng.randint(-128, 127)) for _ in range(2)]
+            for x, y in xs:
+                dut.pos.value = pos
+                dut.pair.value = pair
+                dut.we_even.value = 1
+                dut.wdata.value = s8(x)
+                await RisingEdge(dut.clk)
+                dut.we_even.value = 0
+                dut.wdata.value = s8(y)
+                await Timer(1, unit="ns")
+                c, s = rm.rope_cs(pos, pair)
+                ex = rm._sat((x * c - y * s + 128) >> 8, 8)
+                ey = rm._sat((x * s + y * c + 128) >> 8, 8)
+                assert (signed(dut.xo.value, 8), signed(dut.yo.value, 8)) == (ex, ey), (pos, pair, x, y)
+                n += 1
+    dut._log.info(f"rope rotator: {n} pairs match")
