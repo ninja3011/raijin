@@ -439,3 +439,59 @@ async def test_int4_kv_cache(dut):
     await bus.write(0x5012, 0)
     with open(os.path.join(os.path.dirname(__file__), "..", "results", f"kv4_N{N}_D{D}.txt"), "w") as f:
         f.write(chr(10).join(summary) + chr(10))
+
+
+@cocotb.test()
+async def test_key_skip(dut):
+    """Hardware key skip (SKIPTHR, 0x5013): keys scoring SKIPTHR or more powers
+    of two below the running max get p = 0. When no row of a P-row group uses a
+    key, its V row is never read (VSKIPS, 0x5014). Bit-exact with the model for
+    fused, unfused, causal and decode passes; accuracy vs FP32 is recorded."""
+    bus = await setup(dut)
+    rng = np.random.default_rng(int(os.environ.get("RAIJIN_SEED", 7)) + 23)
+    summary = []
+    for name, kw in CASES:
+        qf, kf, vf = rm.random_case(rng, n=N, d=D, **kw)
+        args = rm.prepare(qf, kf, vf)
+        await load(bus, *args)
+        ref = rm.reference(qf, kf, vf)
+        refc = rm.reference_causal(qf, kf, vf)
+        for thr in (0, 6, 4, 2):
+            await bus.write(0x5013, thr)
+            assert await bus.read(0x5013) == thr
+            for fused, causal in ((False, False), (True, False), (True, True)):
+                for mode in (rm.MODE_EXACT, rm.MODE_MF2):
+                    exp = rm.attention(*args, fused=fused, mode=mode, causal=causal, thr=thr)
+                    o, eo, cycles, skips = await run_pass(bus, fused, mode, causal=causal)
+                    vsk = await bus.read32(0x5014)
+                    tag = f"{name} thr={thr} fused={int(fused)} causal={int(causal)} mode={mode}"
+                    assert np.array_equal(o, exp.o), f"{tag}: output mismatch\nrtl=\n{o}\nmodel=\n{exp.o}"
+                    assert np.array_equal(eo, exp.eo), f"{tag}: exponent mismatch"
+                    assert skips == exp.skips, f"{tag}: skips rtl={skips} model={exp.skips}"
+                    exp_v = rm.v_reads_saved(exp.used, P, causal)
+                    assert vsk == exp_v, f"{tag}: vskips rtl={vsk} model={exp_v}"
+                    r = refc if causal else ref
+                    got = rm.mx_dequantize(o, eo)
+                    cos = float(np.mean([np.dot(got[i], r[i]) / np.linalg.norm(got[i]) /
+                                         np.linalg.norm(r[i]) for i in range(N)]))
+                    total = N * N if not causal else N * (N + 1) // 2
+                    beats = (N // P) * N if not causal else sum((g + 1) * P for g in range(N // P))
+                    summary.append(f"{tag:46s} cycles={cycles:4d} p0_keys={skips:3d}/{total:3d} "
+                                   f"v_saved={vsk:3d}/{beats:3d} mean_row_cos={cos:.5f}")
+                    dut._log.info(summary[-1])
+            # decode: one row, every zero-p key saves its V read
+            for t in (N // 2 - 1, N - 1):
+                q, eq, k, ek, v, ev = args
+                await bus.write(0x5010, t + 1)
+                await bus.write(0x5011, t)
+                await bus.write(0x5000, 1 | (1 << 4))
+                await wait_done(dut)
+                o, eo, cycles, skips = await read_out(bus, rows=[t])
+                vsk = await bus.read32(0x5014)
+                exp = rm.attention_decode(*args, qrow=t, length=t + 1, thr=thr)
+                tag = f"{name} thr={thr} decode len={t + 1}"
+                assert np.array_equal(o[t], exp.o[0]) and eo[t] == exp.eo[0], f"{tag}: mismatch"
+                assert skips == exp.skips and vsk == exp.skips, f"{tag}: skips={skips} vsk={vsk} model={exp.skips}"
+    await bus.write(0x5013, 0)
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", f"keyskip_N{N}_D{D}.txt"), "w") as f:
+        f.write(chr(10).join(summary) + chr(10))

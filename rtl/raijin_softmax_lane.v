@@ -18,6 +18,8 @@
 // mask (causal pass) passes a key through without touching m or l and with
 // p = 0, so the accumulators skip it; out_mask tells the core not to count it
 // as an underflow skip.
+// thr (key skip, 0 = off): a key whose score lies thr or more powers of two
+// below the running max gets p = 0 (and no MF terms), like an underflow.
 `default_nettype none
 module raijin_softmax_lane #(
     parameter TW = 8
@@ -34,6 +36,7 @@ module raijin_softmax_lane #(
     input  wire              first,      // first key of a group (restart m, l)
     input  wire              last,       // last key of a group (auto reciprocal)
     input  wire              mask,       // key masked for this row (causal)
+    input  wire [3:0]        thr,        // key-skip threshold (0 = off)
     // stage B outputs
     output reg               out_valid,
     output reg  [TW-1:0]     out_tag,
@@ -97,7 +100,10 @@ module raijin_softmax_lane #(
     wire [4:0]  dsh = (a_delta > 10'd31) ? 5'd31 : a_delta[4:0];
     wire [12:0] l_b  = a_first ? 13'd0 : l;              // l before this key
     wire [12:0] l_sh = l_b >> dsh;
-    wire [8:0]  p_e  = a_mask ? 9'd0 : p;                 // masked key adds nothing
+    wire signed [14:0] t_k  = ($signed(a_m) <<< 4) - $signed(a_s);
+    wire        prune = (thr != 4'd0) && (t_k[14:4] >= {7'd0, thr});
+    wire        zero  = a_mask || prune;
+    wire [8:0]  p_e  = zero ? 9'd0 : p;                   // masked / pruned: nothing
     wire [12:0] l_nx = l_sh + {4'd0, p_e};
     reg         auto_go;                                  // reciprocal of l_fin
     reg  [12:0] l_fin;
@@ -126,8 +132,8 @@ module raijin_softmax_lane #(
     always @(posedge clk) begin
         out_tag <= a_tag;
         out_p   <= p_e;
-        out_sa  <= sa;
-        out_sb  <= sb;
+        out_sa  <= zero ? 4'd15 : sa;
+        out_sb  <= zero ? 4'd15 : sb;
         b_delta <= dsh;
         out_first <= a_valid && a_first;
         out_last  <= a_valid && a_last;

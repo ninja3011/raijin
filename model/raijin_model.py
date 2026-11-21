@@ -83,14 +83,18 @@ def term(sh: int) -> int:
     return 0 if sh > 8 else 256 >> sh
 
 
-def exp2(s: int, m: int, mode: int) -> Tuple[int, int, int]:
+def exp2(s: int, m: int, mode: int, thr: int = 0) -> Tuple[int, int, int]:
     """p = 2^(s/16 - m) in Q1.8 plus the two shift codes used by the AV path.
 
     Returns (p, sa, sb). In exact mode sa/sb are unused (returned as NONE_CODE).
+    thr (key-skip threshold, 0 = off): a key whose score is thr or more
+    powers of two below the running max gets p = 0 and is skipped.
     """
     t = m * 16 - s
     assert t >= 0
     k, f = t >> 4, t & 15
+    if thr and k >= thr:
+        return 0, NONE_CODE, NONE_CODE
     if mode == MODE_EXACT:
         p = 0 if k >= 9 else EXP_LUT[f] >> k
         return p, NONE_CODE, NONE_CODE
@@ -144,10 +148,25 @@ class PassResult:
     skips: int = 0
     l: List[int] = field(default_factory=list)
     scores: np.ndarray | None = None
+    used: np.ndarray | None = None   # (rows, keys) bool: key j added to row i
+
+
+def v_reads_saved(used: np.ndarray, p: int, causal: bool = False) -> int:
+    """V-row reads the RTL saves: one per (group, key) beat in which no row of
+    the P-row group uses the key. A causal pass streams group g only up to
+    key g*P+P-1."""
+    n_rows, n_keys = used.shape
+    saved = 0
+    for g in range(n_rows // p):
+        last = g * p + p - 1 if causal else n_keys - 1
+        for j in range(last + 1):
+            if not used[g * p:(g + 1) * p, j].any():
+                saved += 1
+    return saved
 
 
 def attention(q, eq, k, ek, v, ev, *, fused: bool, mode: int = MODE_EXACT,
-              offset: int = 0, causal: bool = False) -> PassResult:
+              offset: int = 0, causal: bool = False, thr: int = 0) -> PassResult:
     """Full attention pass. causal (fused only): row i sees keys 0..i; masked
     keys are not processed at all (and not counted as skips). e_vmax is still
     taken over all N V rows, as in the RTL."""
@@ -162,6 +181,7 @@ def attention(q, eq, k, ek, v, ev, *, fused: bool, mode: int = MODE_EXACT,
     skips = 0
     ls = []
     scores = np.zeros((n, n), dtype=np.int64)
+    used = np.zeros((n, n), dtype=bool)
     for i in range(n):
         s = [requant(dpu(q[i], k[j]), int(eq[i]) + int(ek[j]), offset) for j in range(n)]
         scores[i] = s
@@ -173,10 +193,11 @@ def attention(q, eq, k, ek, v, ev, *, fused: bool, mode: int = MODE_EXACT,
                 mn = max(m, ceil_int(s[j]))
                 delta = mn - m
                 m = mn
-                p, _, _ = exp2(s[j], m, mode)
+                p, _, _ = exp2(s[j], m, mode, thr)
                 if p == 0:
                     skips += 1          # delta is always 0 here
                     continue
+                used[i, j] = True
                 dsh = min(delta, 31)
                 lsum = (lsum >> dsh) + p
                 for c in range(d):
@@ -186,10 +207,11 @@ def attention(q, eq, k, ek, v, ev, *, fused: bool, mode: int = MODE_EXACT,
             for j in range(n):
                 m = max(m, ceil_int(s[j]))
             for j in range(n):
-                p, _, _ = exp2(s[j], m, mode)
+                p, _, _ = exp2(s[j], m, mode, thr)
                 if p == 0:
                     skips += 1
                     continue
+                used[i, j] = True
                 lsum += p
                 for c in range(d):
                     acc[c] += pv_term(p, v[j][c], dvs[j])
@@ -200,12 +222,12 @@ def attention(q, eq, k, ek, v, ev, *, fused: bool, mode: int = MODE_EXACT,
         row, e = out_row(acc, recip(lsum), emax)
         o[i] = row
         eo[i] = e
-    return PassResult(o=o, eo=eo, skips=skips, l=ls, scores=scores)
+    return PassResult(o=o, eo=eo, skips=skips, l=ls, scores=scores, used=used)
 
 
 def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
                      mode: int = MODE_EXACT, offset: int = 0,
-                     emax_len: int | None = None) -> PassResult:
+                     emax_len: int | None = None, thr: int = 0) -> PassResult:
     """One KV-cache decode step: query row `qrow` attends to keys 0..length-1.
 
     This is the fused (online softmax) pass for one query over a key prefix.
@@ -223,7 +245,7 @@ def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
         mn = max(m, ceil_int(s[j]))
         delta = mn - m
         m = mn
-        p, _, _ = exp2(s[j], m, mode)
+        p, _, _ = exp2(s[j], m, mode, thr)
         if p == 0:
             skips += 1
             continue
@@ -239,7 +261,7 @@ def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
 
 def attention_decode_multi(q, eq, k, ek, v, ev, *, group: int, p: int, length: int,
                            spec: bool = False, mode: int = MODE_EXACT,
-                           offset: int = 0) -> PassResult:
+                           offset: int = 0, thr: int = 0) -> PassResult:
     """Multi-query decode step: the p query rows of `group` (rows group*p ..
     group*p+p-1) attend to the cached keys in one step, as the RTL does.
 
@@ -251,7 +273,7 @@ def attention_decode_multi(q, eq, k, ek, v, ev, *, group: int, p: int, length: i
     for r in range(p):
         n_keys = length - p + r + 1 if spec else length
         res = attention_decode(q, eq, k, ek, v, ev, qrow=group * p + r, length=n_keys,
-                               mode=mode, offset=offset, emax_len=length)
+                               mode=mode, offset=offset, emax_len=length, thr=thr)
         rows.append(res.o[0])
         eos.append(res.eo[0])
         ls += res.l

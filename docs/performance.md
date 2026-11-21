@@ -60,6 +60,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 | 4 | Multi-query decode: GQA/MQA and speculative verify (CTRL bits 6, 7) | RTL merged | One step serves P query rows at LEN = 16: **49** cycles for 2 rows at P = 2, against 96 for 2 single steps (1.96×), and **53** cycles for 4 rows at P = 4, against 200 (3.77×). Decode throughput per cycle scales with P |
 | 6 | MXINT4 KV cache (KVFMT 0x5012: bit 0 K, bit 1 V) | RTL merged | With K and V both INT4, the same SRAM holds **2N = 32 tokens** instead of 16, and every step is bit-exact. Accuracy cost is mean cosine 0.965 to 0.983 against 0.9996+ for INT8. V-only INT4 keeps 0.991 |
 | 7 | Streaming KV cache with attention sinks (StreamingLLM) | Test and host policy, no RTL change | Generation runs past the 16-row cache. Over 48 tokens with 4 sinks, every step is bit-exact; mean cosine vs FP32 is 0.99983 overall and 0.99979 for tokens past the cache size |
+| 8 | Hardware key skip and V-read gating (SKIPTHR 0x5013, VSKIPS 0x5014) | RTL merged | Cycles unchanged; this is an energy feature. With the gate alone (SKIPTHR = 0), a fused pass on sharp attention skips 15 of 64 V-row reads (23%), and 10 of 64 (16%) on outlier-heavy data. SKIPTHR = 6 raises that to 25 of 64 (39%) with cosine 0.99984 against 0.99986. Lower thresholds save more but cost accuracy on flat attention |
 
 ### 1. Timing closure
 
@@ -250,3 +251,73 @@ KVQuant report for LLM caches. In practice:
 - Use KVFMT = 3 for twice the context.
 - Feature 9 (adaptive precision) targets the gap: it would keep INT8 for
   tokens whose exponent spread shows outliers.
+
+### 8. Hardware key skip and V-read gating
+
+In decode, and in any pass over a long context, most keys get a softmax
+weight that rounds to nothing. Before this feature, the hardware still
+read each of those keys' V rows from SRAM and ran its accumulate beat with a
+zero weight. Fetching a 128-bit SRAM word costs much more energy than the
+add it feeds, so those reads were pure waste. (SpAtten and A3 make the same
+argument for pruning keys.)
+
+Two mechanisms, both in the fused, unfused, causal and decode dataflows:
+
+- **V-read gating (always on).** The V row for a key is read only if at
+  least one lane of the current P-row group will add it (`v_rd = acc_valid
+  && |acc_en` in `raijin_core`). A key that underflowed (p = 0) in every row
+  of the group costs no SRAM read and no accumulator toggle. The beat still
+  takes its cycle, so timing and bit-exactness don't change. A saved beat
+  also leaves SRAM port 0 free, so the O-write queue drains sooner.
+- **Key-skip threshold (SKIPTHR, 0x5013, 4 bits, 0 = off).** A key whose
+  score sits SKIPTHR or more powers of two below the running max gets p = 0
+  and no multiplier-free terms. Its weight is below 2^-SKIPTHR of the
+  largest one. The test is one 11-bit compare on t = 16·m − s, which the lane
+  already computes for the exponential (`prune` in `raijin_softmax_lane`).
+  Pruned keys count in SKIPS like underflows. In the fused dataflow the
+  running max only rises, so a key pruned against the running max would also
+  be pruned against the final max.
+
+**Counters.** VSKIPS (0x5014..7, 32 bits) counts V-row reads saved in the
+last pass. SKIPS still counts (row, key) pairs with p = 0.
+
+**Model.** `rm.exp2(..., thr)`, plus `thr` on `attention`,
+`attention_decode` and `attention_decode_multi`. `PassResult.used` records
+which (row, key) pairs contributed. `rm.v_reads_saved(used, P, causal)` gives
+the VSKIPS value the RTL must report.
+
+`test_key_skip` covers SKIPTHR = 0, 6, 4 and 2 on three tensor families. Each
+combination runs unfused, fused and causal passes in exact and MF2 modes,
+plus two decode steps. Outputs, exponents, SKIPS and VSKIPS all match the
+model exactly (`results/keyskip_N16_D16.txt`). The full suite passes at P = 2
+and P = 4.
+
+**Measured at P = 4, fused pass, exact mode** (64 V-row beats: 4 groups × 16 keys):
+
+| Family | SKIPTHR | Zero-weight keys | V reads saved | Mean row cosine vs FP32 |
+| --- | --- | --- | --- | --- |
+| random | 0 | 0 / 256 | 0 | 0.99980 |
+| random | 6 | 5 / 256 | 0 | 0.99979 |
+| random | 4 | 42 / 256 | 0 | 0.99693 |
+| sharp | 0 | 165 / 256 | 15 (23%) | 0.99986 |
+| sharp | 6 | 182 / 256 | 25 (39%) | 0.99984 |
+| sharp | 4 | 191 / 256 | 27 (42%) | 0.99971 |
+| outliers | 0 | 115 / 256 | 10 (16%) | 0.99846 |
+| outliers | 6 | 132 / 256 | 12 (19%) | 0.99719 |
+| outliers | 4 | 155 / 256 | 19 (30%) | 0.93286 |
+
+**What this shows, honestly.**
+
+- The gate is free and always helps. It needs no threshold and changes no
+  output.
+- SKIPTHR = 6 (weights below 1/64) costs nothing measurable on random or sharp
+  attention, but costs 0.0013 cosine on outlier-heavy data. SKIPTHR ≤ 4 is
+  only safe when attention is known to be sharp.
+- A V read is saved only when all P rows of a group skip the key, so savings
+  shrink as P grows. Decode rows and P = 2 builds save more per key. Real LLM
+  attention over long contexts is much sparser than these 16-key tests, so
+  these figures are a lower bound on what a long-context decode would save.
+- Cycles are unchanged. Turning saved beats into saved cycles would mean
+  compacting the key stream ahead of the accumulators. That is left for later,
+  because it would break the fixed schedule that the O-write queue relies on.
+

@@ -65,6 +65,10 @@
 //                  8t of its region, element 2b in the low nibble of byte b), so
 //                  with both bits set the cache holds 2N tokens. Each nibble
 //                  enters the INT8 datapath as x4 << 4.
+//   0x5013  SKIPTHR key-skip threshold (0 = off): keys scoring SKIPTHR or more
+//                  powers of two below the running max are dropped (p = 0)
+//   0x5014..7 VSKIPS (little endian) V-row reads saved this pass: no lane
+//                  needed the V row, so it was never read
 //   e_k / e_v exponents: 0x41tt / 0x42tt for tokens t = 0..2N-1
 `default_nettype none
 `ifdef RAIJIN_SKY130_SRAM
@@ -148,6 +152,8 @@ module raijin_core #(
     reg signed [7:0]  offset;
     reg [LK:0]        len;
     reg               k4, v4;         // KVFMT: MXINT4 K (bit 0), V (bit 1)
+    reg  [3:0]        thr;            // SKIPTHR
+    reg  [31:0]       vskips;         // V reads saved
     reg [LN-1:0]      qrow;
     reg [31:0]        cycles, skips;
     assign busy = busy_r;
@@ -411,6 +417,7 @@ module raijin_core #(
                 .first(sm_first), .last(sm_last),
                 .mask((causal && (sm_j > sm_g * P + gr)) ||
                       (spec && ({1'b0, sm_j} + P > len + gr))),
+                .thr(thr),
                 .out_valid(sm_ovalid[gr]), .out_tag(sm_otag[gr*TW +: TW]),
                 .out_p(sm_p[gr*9 +: 9]), .out_sa(sm_sa[gr*4 +: 4]), .out_sb(sm_sb[gr*4 +: 4]),
                 .out_delta(sm_delta[gr*5 +: 5]),
@@ -481,7 +488,9 @@ module raijin_core #(
             acc_en[ai]   = acc_valid && acc_lane[ai] && (acc_p[ai*9 +: 9] != 9'd0);
         end
     end
-    wire v_rd = acc_valid;
+    // a V row is read only if some lane will use it (key skip saves the read)
+    wire v_rd    = acc_valid && (|acc_en);
+    wire v_saved = acc_valid && !(|acc_en);
 
     reg            av1, av2;
     reg [LK-1:0]   aj1, aj2;
@@ -731,6 +740,11 @@ module raijin_core #(
                               5'h10: rd_reg <= len;
                               5'h11: rd_reg <= qrow;
                               5'h12: rd_reg <= {6'd0, v4, k4};
+                              5'h13: rd_reg <= {4'd0, thr};
+                              5'h14: rd_reg <= vskips[7:0];
+                              5'h15: rd_reg <= vskips[15:8];
+                              5'h16: rd_reg <= vskips[23:16];
+                              5'h17: rd_reg <= vskips[31:24];
                               default: rd_reg <= 8'd0;
                           endcase
                     default: rd_reg <= 8'd0;
@@ -774,6 +788,8 @@ module raijin_core #(
             len    <= N;
             k4     <= 1'b0;
             v4     <= 1'b0;
+            thr    <= 4'd0;
+            vskips <= 32'd0;
             qrow   <= {LN{1'b0}};
             cycles <= 32'd0;
             skips  <= 32'd0;
@@ -790,6 +806,7 @@ module raijin_core #(
             if (we_r && creg && !busy_r) begin
                 if (cidx == 5'h01) offset <= wdata_r;
                 if (cidx == 5'h10) len    <= wdata_r[LK:0];
+                if (cidx == 5'h13) thr <= wdata_r[3:0];
                 if (cidx == 5'h12) begin
                     k4 <= wdata_r[0];
                     v4 <= wdata_r[1];
@@ -799,6 +816,7 @@ module raijin_core #(
             if (busy_r) begin
                 cycles <= cycles + 32'd1;
                 skips  <= skips + nskip;
+                if (v_saved) vskips <= vskips + 32'd1;
             end
             case (state)
                 S_IDLE: begin
@@ -814,6 +832,7 @@ module raijin_core #(
                         done_r <= 1'b0;
                         cycles <= 32'd0;
                         skips  <= 32'd0;
+                        vskips <= 32'd0;
                         owr_cnt <= 0;
                         g      <= wdata_r[4] ? qrow / P : {LG{1'b0}};
                         j      <= 0;
