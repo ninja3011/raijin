@@ -202,7 +202,7 @@ module raijin_core #(
     //   write 0x6000 + b:  b 0..15 Q[QROW], 16..31 K[tok], 32..47 V[tok],
     //                      48 e_q[QROW], 49 e_k[tok], 50 e_v[tok],
     //                      51 CTRL: LEN <= LEN + 1, then start with this value
-    //   read  0x6000 + b:  b 0..15 O[QROW], 16 e_o[QROW]
+    //   read  0x6000 + b:  b 0..15 O[QROW], 16 e_o[QROW], 17 HHMIN (eviction slot)
     // tok is the next cache slot, LEN (through PTAB when PAGED is set).
     // INT8 K/V only. Each byte is translated to its ordinary address, so RoPE,
     // paging and the busy rules apply unchanged.
@@ -216,8 +216,9 @@ module raijin_core #(
         baddr = addr_r;
         if (twin) begin
             if (re_r && !we_r)
-                baddr = (tb < 6'd16) ? {4'h3, {(12-LN-LD){1'b0}}, qrow, tb[LD-1:0]}
-                                     : {8'h43, {(8-LN){1'b0}}, qrow};
+                baddr = (tb < 6'd16)  ? {4'h3, {(12-LN-LD){1'b0}}, qrow, tb[LD-1:0]} :
+                        (tb == 6'd17) ? 16'h7081 :
+                                        {8'h43, {(8-LN){1'b0}}, qrow};
             else if (tb < 6'd16) baddr = {4'h0, {(12-LN-LD){1'b0}}, qrow,  tb[LD-1:0]};
             else if (tb < 6'd32) baddr = {4'h1, {(12-LN-LD){1'b0}}, ttrow, tb[LD-1:0]};
             else if (tb < 6'd48) baddr = {4'h2, {(12-LN-LD){1'b0}}, ttrow, tb[LD-1:0]};
@@ -487,11 +488,11 @@ module raijin_core #(
     wire [LK-1:0]   sm_j     = sm_tag_in[LK-1:0];
     wire            sm_last  = pipe && (causal ? (sm_j == sm_g * P + P - 1) : (sm_j == N - 1));
     wire [P-1:0]    sm_omask;
+    wire [P*9-1:0]  sm_m;
 
     generate
         for (gr = 0; gr < P; gr = gr + 1) begin : g_sm
             wire signed [11:0] s_in = fused ? score[gr*12 +: 12] : sb_rd[gr*12 +: 12];
-            wire signed [8:0] m_unused;
             wire [12:0]       l_unused;
             raijin_softmax_lane #(.TW(TW)) u_lane (
                 .clk(clk), .rst_n(rst_n), .clear(sm_clear), .mode(mode),
@@ -505,11 +506,29 @@ module raijin_core #(
                 .out_p(sm_p[gr*9 +: 9]), .out_sa(sm_sa[gr*4 +: 4]), .out_sb(sm_sb[gr*4 +: 4]),
                 .out_delta(sm_delta[gr*5 +: 5]),
                 .out_first(sm_ofirst[gr]), .out_last(sm_olast[gr]), .out_mask(sm_omask[gr]),
-                .m(m_unused), .l(l_unused),
+                .m(sm_m[gr*9 +: 9]), .l(l_unused),
                 .recip_start(rcp_go), .r_valid(sm_rvalid[gr]), .r(sm_r[gr*13 +: 13])
             );
         end
     endgenerate
+
+    // ---- heavy-hitter tracker (feature 15, region 7) ----
+    // physical slot of the key now entering the lanes (same mapping as pj)
+    wire          sj_is4 = pfmt[sm_j[LK-1:LPG]];
+    wire [LK-1:0] pj_s   = mx_on ? ({ptab[sm_j[LK-1:LPG]], {LPG{1'b0}}} + (sj_is4 ? sm_j[LPG-1:0] : {sm_j[LPG-1:0], 1'b0}))
+                         : pg_on ? {ptab[sm_j[LK-1:LPG]], sm_j[LPG-1:0]} : sm_j;
+    wire          hh_busy, hh_en;
+    wire [LK-1:0] hh_recent;
+    wire [7:0]    hh_rd;
+    raijin_hh #(.NK(NK), .LK(LK)) u_hh (
+        .clk(clk), .rst_n(rst_n),
+        .cap_valid(decode && !multi && sm_valid), .cap_slot(pj_s),
+        .cap_s(score[qlane*12 +: 12]),
+        .cap_recent({1'b0, sm_j} + hh_recent >= len), .cap_clear(state == F_CLR && decode),
+        .go(state == RCP_START && decode && !multi), .m_fin(sm_m[qlane*9 +: 9]),
+        .busy(hh_busy),
+        .bus_we(we_r && !busy_r && region == 4'h7), .bus_off(boff[7:0]),
+        .bus_wdata(wdata_r), .bus_rdata(hh_rd), .en(hh_en), .recent(hh_recent));
 
     // score buffer writes (unfused): scores from the DPUs, then p codes
     wire            sb_we   = !fused && (dpu_valid[0] || sm_ovalid[0]);
@@ -854,6 +873,7 @@ module raijin_core #(
                                              {(4-(LK-LPG)){1'b0}}, ptab[{cidx[1:0], 1'b0}]};
                               default: rd_reg <= 8'd0;
                           endcase
+                    4'h7: rd_reg <= hh_rd;
                     default: rd_reg <= 8'd0;
                 endcase
             end
@@ -1096,7 +1116,7 @@ module raijin_core #(
                     dcnt <= dcnt - 1'b1;
                     if (dcnt == 0) state <= RCP_START;
                 end
-                S_DONE: begin
+                S_DONE: if (!hh_busy) begin    // the tracker walk finishes first
                     busy_r <= 1'b0;
                     done_r <= 1'b1;
                     state  <= S_IDLE;

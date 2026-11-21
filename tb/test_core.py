@@ -884,3 +884,66 @@ async def test_gl_short(dut):
     dut._log.info(msg)
     with open(os.path.join(os.path.dirname(__file__), "..", "results", "gl_window.txt"), "w") as f:
         f.write(msg + chr(10))
+
+
+@cocotb.test()
+async def test_heavy_hitter(dut):
+    """Heavy-hitter tracker (feature 15, region 7): every single-row decode step
+    adds each cached key's max-normalised attention weight to its slot's
+    accumulator, and HHMIN names the lowest-scoring slot outside the sinks and
+    the recent window. All
+    accumulators and HHMIN are bit-exact with rm.hh_step; clear, halve, the
+    per-slot clear and the token-window readback (byte 17) are checked too."""
+    bus = await setup(dut)
+    rng = np.random.default_rng(int(os.environ.get("RAIJIN_SEED", 7)) + 71)
+    skip, recent = 2, 4
+    summary = []
+
+    async def read_acc():
+        a = []
+        for sl in range(rm.HH_NK):
+            lo = await bus.read(0x7000 + 2 * sl)
+            hi = await bus.read(0x7001 + 2 * sl)
+            a.append(lo | hi << 8)
+        return a
+
+    await bus.write(0x7080, 0b011)          # enable, clear all
+    await bus.write(0x7082, skip)
+    await bus.write(0x7083, recent)
+    assert await bus.read(0x7080) == 1 and await bus.read(0x7082) == skip and await bus.read(0x7083) == recent
+    for name, kw in CASES[:2]:
+        qf, kf, vf = rm.random_case(rng, n=N, d=D, **kw)
+        q, eq, k, ek, v, ev = rm.prepare(qf, kf, vf)
+        await load(bus, q, eq, k, ek, v, ev)
+        await bus.write(0x7080, 0b011)
+        acc = [0] * rm.HH_NK
+        for t in range(N):
+            await bus.write(0x5010, t + 1)
+            await bus.write(0x5011, t)
+            await bus.write(0x5000, 1 | (1 << 4))
+            await wait_done(dut)
+            o, eo, cycles, _ = await read_out(bus, rows=[t])
+            exp = rm.attention_decode(q, eq, k, ek, v, ev, qrow=t, length=t + 1)
+            assert np.array_equal(o[t], exp.o[0]) and eo[t] == exp.eo[0], f"{name} t={t}: decode output"
+            sc = rm.decode_scores(q, eq, k, ek, qrow=t, length=t + 1)
+            mexp = rm.hh_step(acc, sc, list(range(t + 1)), skip, recent)
+            if t >= skip + recent:
+                assert await bus.read(0x7081) == mexp, f"{name} t={t}: HHMIN"
+        got = await read_acc()
+        assert got == acc, f"{name}: accumulators\nrtl={got}\nmodel={acc}"
+        summary.append(f"hh {name:8s} after {N} steps: acc={acc[:N]} HHMIN={mexp} decode cycles at LEN=N: {cycles}")
+        dut._log.info(summary[-1])
+    # decay, per-slot clear, token-window byte 17
+    await bus.write(0x7080, 0b101)
+    acc = [a >> 1 for a in acc]
+    await bus.write(0x7000 + 2 * 5, 0)
+    acc[5] = 0
+    assert await read_acc() == acc, "halve / per-slot clear"
+    assert await bus.read(0x6011) == mexp, "token window HHMIN"
+    # disabled: accumulators stay put
+    await bus.write(0x7080, 0)
+    await bus.write(0x5000, 1 | (1 << 4))
+    await wait_done(dut)
+    assert await read_acc() == acc, "tracker off"
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", f"heavy_hitter_N{N}_D{D}.txt"), "w") as f:
+        f.write(chr(10).join(summary) + chr(10))

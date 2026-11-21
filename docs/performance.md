@@ -67,6 +67,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 | 12 | QSPI host port (0x32 quad write, 0x6B quad read, io[3:0]) | RTL merged | A full Q/K/V load drops from 1,069 µs to **286 µs** (3.7×). Bus time per decode token drops from 135 µs to **66.9 µs**, so the host-limited rate goes from 7,400 to about **15,000 tokens/s**. Plain SPI hosts still work |
 | 13 | Token window (region 0x6000): one write burst and one read burst per decode token | RTL merged | Bus time per decode token over QSPI 66.9 → **36.2 µs**, about **27,700 tokens/s** host-limited: 3.7× the single-lane SPI baseline of feature 11. Works with paging and RoPE |
 | 14 | Per-page mixed KV precision (PAGED bit 1, PFMT 0x501B) | RTL merged | 24 tokens in the 16-word cache: 2 INT8 pages + 4 INT4 pages. On sharp attention, mean decode cosine 0.9656 (all INT4) → **0.9914** with INT8 for the sink page and the worst-error page. No cycle cost |
+| 15 | Heavy-hitter tracker for KV eviction (region 0x7000, `rtl/raijin_hh.v`) | RTL merged | Per-slot accumulators of attention weight and an on-chip argmin (HHMIN) give the host its H2O eviction victim with one byte read, also in the token window. Decode step 50 → **62** cycles at LEN = 16 with the tracker on, unchanged when off. Bit-exact with the model. On the char LMs, chip H2O matches FP H2O within 0.25% and beats a sliding window at budget 16 (4.608 vs 4.633), but loses at budget 8 |
 
 ### 1. Timing closure
 
@@ -738,6 +739,86 @@ cosine against FP32 causal attention, `results/mixed_kv_N16_D16.txt`):
   which checks that keys beyond LEN and pages of other formats are never read
   into the result.
 
+
+### 15. Heavy-hitter tracker for KV eviction
+
+Feature 7 lets generation run past the cache with a fixed rule: keep the sinks
+and the newest tokens (StreamingLLM). H2O (Zhang et al., 2023) evicts by
+importance instead: keep the tokens that have collected the most attention so
+far, plus a recent window. In software that needs every step's probabilities,
+which the host never sees on Raijin. The tracker computes the statistic where
+the scores already are.
+
+**Hardware** (`rtl/raijin_hh.v`, region 7 of the bus):
+
+- During a single-row decode step the core passes each key's Q.4 score and its
+  physical slot (after paging) to the tracker, which latches them.
+- When the row's final running maximum m is known, the tracker walks the 32
+  slots, one per cycle, and adds each captured key's max-normalised weight
+  w = 2^((s − 16m)/16) to a 16-bit saturating accumulator. The weight is
+  approximated in Q0.8 as `(frac >= 1/2 ? 181 : 256) >> floor((16m − s)/16)`,
+  with 181 = 256/√2, and zero below 2^−8. No exp unit, no divider: one
+  subtract, one shift and one add per slot.
+- The same walk finds the slot with the smallest accumulator, skipping the
+  first HHSKIP slots (sinks) and keys among the newest HHRECENT positions of
+  the step (the H2O recent window). That slot is HHMIN.
+- Max-normalised weights are not probabilities: they skip the division by the
+  row sum. This is the price of having no divider, and the evaluation below
+  checks what it costs.
+
+| Offset | Name | Meaning |
+| --- | --- | --- |
+| 0x000 + 2k, +1 | ACC[k] | accumulator of slot k, low and high byte; any write clears it |
+| 0x080 | HHCTL | bit 0 enable, bit 1 clear all, bit 2 halve all (decay) |
+| 0x081 | HHMIN | eviction candidate after the last step; also byte 17 of the token-window read |
+| 0x082 | HHSKIP | slots below this are never chosen (sinks) |
+| 0x083 | HHRECENT | keys among the newest HHRECENT of the step are never chosen |
+
+**Cost.** The walk runs in parallel with the reciprocal and output stages, and
+the step's DONE waits for it. A decode step at LEN = 16 takes **62** cycles
+with the tracker on against 50 off. The tracker is idle and adds no cycles when
+HHCTL bit 0 is clear. Walking only the used slots would cut the overhead at
+short lengths; this is left as a possible refinement.
+
+**Verification** (`tb/test_core.py::test_heavy_hitter`,
+`results/heavy_hitter_N16_D16.txt`): two score families, 16 decode steps each,
+with skip = 2 and recent = 4. After each step all 32 accumulators and HHMIN
+match `raijin_model.hh_step` bit for bit. The test also checks halve, the
+per-slot clear, the token-window byte, and that a disabled tracker leaves the
+accumulators untouched.
+
+**Does it pick good victims?** `eval/eviction.py` runs the character LMs of
+the evaluation section with a per-head cache budget B over their 32-token
+context, evicting one token per step once full. Attention itself is FP32, so
+only the policy differs. Policies: *window* (2 sinks + newest), *h2o* (2 sinks,
+recent window B/2, evict the smallest chip accumulator) and *h2o-fp* (the same
+with exact probabilities, as published). Perplexity over positions t ≥ B,
+128 validation sequences (`results/eviction_*.txt`):
+
+| Budget | Model | No eviction | Window | Chip H2O | FP H2O |
+| --- | --- | --- | --- | --- | --- |
+| 16 | Tiny Shakespeare | 4.6146 | 4.6331 | **4.6081** | 4.6058 |
+| 16 | WikiText-2 | 3.2942 | 3.3105 | **3.3001** | 3.3008 |
+| 12 | Tiny Shakespeare | 4.6044 | 4.6178 | 4.6174 | 4.6178 |
+| 12 | WikiText-2 | 3.2834 | **3.3069** | 3.3080 | 3.3026 |
+| 8 | Tiny Shakespeare | 4.5851 | **4.6234** | 4.7928 | 4.7808 |
+| 8 | WikiText-2 | 3.3120 | **3.3669** | 3.4308 | 3.4322 |
+
+- The chip's divider-free statistic tracks exact H2O closely: within 0.25% in
+  every row and on either side of it. The approximation is not what limits the
+  policy.
+- At half the context (B = 16), H2O beats the sliding window on both models
+  and recovers most of the eviction loss on Tiny Shakespeare (chip H2O is even
+  slightly below no eviction there, within noise).
+- At B = 12 the two are level, and at B = 8 H2O is clearly worse. With only
+  4 recent slots, character models lose the nearby characters they depend on
+  most. These are small, local models with a 32-token context; H2O's published
+  gains are on word-level LLMs with long contexts, where a few tokens draw
+  attention for thousands of steps. Evaluating that needs a bigger model on
+  the laptop, so it is noted as future work.
+- The tracker is a mechanism, not a fixed policy. The host reads HHMIN or all
+  32 accumulators, and can mix them with recency, decay them (halve) or use
+  them to choose INT8 pages in feature 14.
 
 ## Evaluation inside a real transformer
 

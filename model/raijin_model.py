@@ -259,6 +259,51 @@ def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
                       skips=skips, l=[lsum])
 
 
+def decode_scores(q, eq, k, ek, *, qrow: int, length: int, offset: int = 0):
+    """The Q7.4 scores of one decode step (what the softmax lane sees)."""
+    q, k = np.asarray(q, dtype=np.int64), np.asarray(k, dtype=np.int64)
+    return [requant(dpu(q[qrow], k[j]), int(eq[qrow]) + int(ek[j]), offset) for j in range(length)]
+
+
+HH_NK = 32
+
+
+def hh_step(acc, scores, slots, skip=0, recent=0):
+    """Heavy-hitter tracker (rtl/raijin_hh.v) after one single-row decode step.
+
+    acc: list of HH_NK 16-bit accumulators (updated in place); scores[i] is the
+    score of the key held in physical slot slots[i]. Each key adds its
+    max-normalised weight 2^((s - 16 m) / 16) in Q0.8, as
+    (frac >= 1/2 ? 181 : 256) >> floor((16 m - s) / 16), 0 below 2^-8, where m
+    is the row's final running maximum. Returns the eviction candidate: the
+    slot >= skip with the smallest accumulator among this step's slots (lowest
+    index on ties). Keys among the step's newest `recent` positions are never
+    chosen (H2O keeps a recent window)."""
+    m = M_INIT
+    for sj in scores:
+        m = max(m, ceil_int(sj))
+    used, rec = {}, set()
+    n = len(scores)
+    for j, (sj, sl) in enumerate(zip(scores, slots)):
+        used[sl] = sj
+        if j + recent >= n:
+            rec.add(sl)
+    best, best_k = 1 << 17, 0
+    for sl in range(HH_NK):
+        if sl not in used:
+            continue
+        d = 16 * m - used[sl]
+        if d < 0:
+            w = 256
+        else:
+            di = d >> 4
+            w = 0 if di > 8 else ((181 if d & 8 else 256) >> di)
+        acc[sl] = min(acc[sl] + w, 0xFFFF)
+        if sl >= skip and sl not in rec and acc[sl] < best:
+            best, best_k = acc[sl], sl
+    return best_k
+
+
 def attention_decode_multi(q, eq, k, ek, v, ev, *, group: int, p: int, length: int,
                            spec: bool = False, mode: int = MODE_EXACT,
                            offset: int = 0, thr: int = 0) -> PassResult:
