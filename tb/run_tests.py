@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 RTL = ROOT / "rtl"
 SOURCES = [RTL / f for f in (
     "raijin_dpu.v", "raijin_requant.v", "raijin_exp2.v", "raijin_softmax_lane.v",
-    "raijin_acc_array.v", "raijin_out.v", "raijin_mem.v", "raijin_core.v")]
+    "raijin_acc_array.v", "raijin_dupreg.v", "raijin_out.v", "raijin_mem.v", "raijin_core.v")]
 
 BLOCKS = ["raijin_exp2", "raijin_requant", "raijin_dpu", "raijin_out", "raijin_softmax_lane"]
 

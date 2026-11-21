@@ -476,7 +476,10 @@ module raijin_core #(
     reg              o0_v;
     reg [LN-1:0]     o0_tag;
     reg [D*24-1:0]   o0_acc;
-    reg [12:0]       o0_r;
+    // 1/l is held in OUT_RG copies, one per group of output lanes (see raijin_out)
+    localparam OUT_RG = 4;
+    wire [OUT_RG*13-1:0]  o0_r_bus;
+    raijin_dupreg #(.W(13), .C(OUT_RG)) u_o0r (.clk(clk), .d(rinv[out_row_i]), .q(o0_r_bus));
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) o0_v <= 1'b0;
         else        o0_v <= out_issue;
@@ -484,12 +487,11 @@ module raijin_core #(
     always @(posedge clk) begin
         o0_tag <= out_row_i;
         o0_acc <= acc[orow*D*24 +: D*24];
-        o0_r   <= rinv[out_row_i];
     end
-    raijin_out #(.D(D), .TW(LN)) u_out (
+    raijin_out #(.D(D), .TW(LN), .RG(OUT_RG)) u_out (
         .clk(clk), .rst_n(rst_n),
         .in_valid(o0_v), .in_tag(o0_tag),
-        .acc(o0_acc), .r(o0_r), .emax(emax),
+        .acc(o0_acc), .r(o0_r_bus), .emax(emax),
         .out_valid(o_valid), .out_tag(o_tag), .o(o_row), .eo(o_e)
     );
     always @(posedge clk) begin

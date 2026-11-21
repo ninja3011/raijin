@@ -124,7 +124,7 @@ async def test_out_random(dut):
         if idx < len(vecs):
             acc, r, emax = vecs[idx]
             dut.acc.value = pack(acc, 24)
-            dut.r.value = r
+            dut.r.value = pack([r] * 4, 13)   # RG = 4 identical copies of 1/l
             dut.emax.value = emax
             dut.in_tag.value = idx & 0xFF
             dut.in_valid.value = 1
