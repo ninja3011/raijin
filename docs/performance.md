@@ -102,6 +102,28 @@ broadcast no longer appears among the worst paths. (The Magic DRC count of
 11.3 M is identical to v2, and every one of those errors is inside the
 OpenRAM macros.)
 
+**Full-feature layout** (`sram_p2_speed`, commit cdfef3d, features 1 to 11,
+core only, without the chip-top clock gate):
+
+| Metric | sram_p2_dupreg | sram_p2_speed |
+| --- | --- | --- |
+| Setup WNS / TNS, tt | −2.34 / −89.5 ns | −2.31 / −99.0 ns (about 45 MHz) |
+| Setup WNS, ff / ss | +6.93 / −26.7 ns | +6.54 / −26.2 ns |
+| Hold violations (ss only) | 81 (−1.03 ns) | 192 (−1.28 ns) |
+| Route DRC / antenna / LVS | 0 / 0 / clean | 0 / 0 / clean |
+| Standard-cell area | 0.977 mm² | 1.161 mm² (+19%) |
+| Flops | 5,215 | 7,088 |
+| Utilisation | 36.5% | 40.4% |
+| Power, tt (tool default activity) | 36.5 mW | 126.8 mW |
+
+Features 2 to 11 leave the critical path unchanged: the worst paths are still
+the output-rounding paths that 1b removes. The 3.4× power figure is not yet
+explained. The extra logic is 19% more area and 36% more flops, which can't
+account for it. A per-group breakdown (clock, sequential, combinational,
+macro) is being taken from both runs. The figure is also a vectorless
+estimate at the tool's default switching activity, for a core whose clock
+the chip top gates off most of the time.
+
 **1b. Carry-free output rounding.** The five worst remaining paths all start
 at a shift-amount copy and end at an O-row flop. They pass through about
 1.9 ns of fanout buffers, then the stage-3 rounding add (y + 2^(sh−1)) >>> sh,
