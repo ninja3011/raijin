@@ -1,0 +1,5 @@
+qspi fused=1 causal=0        cycles= 111
+qspi fused=1 causal=1        cycles=  97
+qspi fused=0 causal=0        cycles= 411
+qspi load: 834 bytes for Q, K, V and exponents, 286.1 us on the bus
+qspi decode loop: 16 tokens, 1648 bytes, 66.9 us of bus time per token (host-limited 14,952 tokens/s), 57192 cycles, core clock gated 46896 cycles (82.0%)

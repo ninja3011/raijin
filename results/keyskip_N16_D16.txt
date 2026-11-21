@@ -1,0 +1,72 @@
+random thr=0 fused=0 causal=0 mode=0           cycles= 411 p0_keys=  0/256 v_saved=  0/ 64 mean_row_cos=0.99979
+random thr=0 fused=0 causal=0 mode=2           cycles= 411 p0_keys=  0/256 v_saved=  0/ 64 mean_row_cos=0.99838
+random thr=0 fused=1 causal=0 mode=0           cycles= 111 p0_keys=  0/256 v_saved=  0/ 64 mean_row_cos=0.99980
+random thr=0 fused=1 causal=0 mode=2           cycles= 111 p0_keys=  0/256 v_saved=  0/ 64 mean_row_cos=0.99838
+random thr=0 fused=1 causal=1 mode=0           cycles=  97 p0_keys=  0/136 v_saved=  0/ 40 mean_row_cos=0.99985
+random thr=0 fused=1 causal=1 mode=2           cycles=  97 p0_keys=  0/136 v_saved=  0/ 40 mean_row_cos=0.99901
+random thr=6 fused=0 causal=0 mode=0           cycles= 411 p0_keys=  5/256 v_saved=  0/ 64 mean_row_cos=0.99978
+random thr=6 fused=0 causal=0 mode=2           cycles= 411 p0_keys=  5/256 v_saved=  0/ 64 mean_row_cos=0.99839
+random thr=6 fused=1 causal=0 mode=0           cycles= 111 p0_keys=  5/256 v_saved=  0/ 64 mean_row_cos=0.99979
+random thr=6 fused=1 causal=0 mode=2           cycles= 111 p0_keys=  5/256 v_saved=  0/ 64 mean_row_cos=0.99839
+random thr=6 fused=1 causal=1 mode=0           cycles=  97 p0_keys=  3/136 v_saved=  1/ 40 mean_row_cos=0.99985
+random thr=6 fused=1 causal=1 mode=2           cycles=  97 p0_keys=  3/136 v_saved=  1/ 40 mean_row_cos=0.99901
+random thr=4 fused=0 causal=0 mode=0           cycles= 411 p0_keys= 61/256 v_saved=  0/ 64 mean_row_cos=0.99456
+random thr=4 fused=0 causal=0 mode=2           cycles= 411 p0_keys= 61/256 v_saved=  0/ 64 mean_row_cos=0.99340
+random thr=4 fused=1 causal=0 mode=0           cycles= 111 p0_keys= 42/256 v_saved=  0/ 64 mean_row_cos=0.99693
+random thr=4 fused=1 causal=0 mode=2           cycles= 111 p0_keys= 42/256 v_saved=  0/ 64 mean_row_cos=0.99541
+random thr=4 fused=1 causal=1 mode=0           cycles=  97 p0_keys= 17/136 v_saved=  1/ 40 mean_row_cos=0.99917
+random thr=4 fused=1 causal=1 mode=2           cycles=  97 p0_keys= 17/136 v_saved=  1/ 40 mean_row_cos=0.99837
+random thr=2 fused=0 causal=0 mode=0           cycles= 411 p0_keys=175/256 v_saved= 12/ 64 mean_row_cos=0.91426
+random thr=2 fused=0 causal=0 mode=2           cycles= 411 p0_keys=175/256 v_saved= 12/ 64 mean_row_cos=0.91197
+random thr=2 fused=1 causal=0 mode=0           cycles= 111 p0_keys=135/256 v_saved=  7/ 64 mean_row_cos=0.94618
+random thr=2 fused=1 causal=0 mode=2           cycles= 111 p0_keys=135/256 v_saved=  7/ 64 mean_row_cos=0.94432
+random thr=2 fused=1 causal=1 mode=0           cycles=  97 p0_keys= 55/136 v_saved=  6/ 40 mean_row_cos=0.98007
+random thr=2 fused=1 causal=1 mode=2           cycles=  97 p0_keys= 55/136 v_saved=  6/ 40 mean_row_cos=0.97891
+sharp thr=0 fused=0 causal=0 mode=0            cycles= 411 p0_keys=203/256 v_saved= 23/ 64 mean_row_cos=0.99986
+sharp thr=0 fused=0 causal=0 mode=2            cycles= 411 p0_keys=201/256 v_saved= 22/ 64 mean_row_cos=0.99980
+sharp thr=0 fused=1 causal=0 mode=0            cycles= 111 p0_keys=165/256 v_saved= 15/ 64 mean_row_cos=0.99986
+sharp thr=0 fused=1 causal=0 mode=2            cycles= 111 p0_keys=164/256 v_saved= 15/ 64 mean_row_cos=0.99980
+sharp thr=0 fused=1 causal=1 mode=0            cycles=  97 p0_keys= 74/136 v_saved=  8/ 40 mean_row_cos=0.99994
+sharp thr=0 fused=1 causal=1 mode=2            cycles=  97 p0_keys= 74/136 v_saved=  8/ 40 mean_row_cos=0.99985
+sharp thr=6 fused=0 causal=0 mode=0            cycles= 411 p0_keys=216/256 v_saved= 32/ 64 mean_row_cos=0.99981
+sharp thr=6 fused=0 causal=0 mode=2            cycles= 411 p0_keys=216/256 v_saved= 32/ 64 mean_row_cos=0.99976
+sharp thr=6 fused=1 causal=0 mode=0            cycles= 111 p0_keys=182/256 v_saved= 25/ 64 mean_row_cos=0.99984
+sharp thr=6 fused=1 causal=0 mode=2            cycles= 111 p0_keys=182/256 v_saved= 25/ 64 mean_row_cos=0.99979
+sharp thr=6 fused=1 causal=1 mode=0            cycles=  97 p0_keys= 79/136 v_saved= 12/ 40 mean_row_cos=0.99993
+sharp thr=6 fused=1 causal=1 mode=2            cycles=  97 p0_keys= 79/136 v_saved= 12/ 40 mean_row_cos=0.99984
+sharp thr=4 fused=0 causal=0 mode=0            cycles= 411 p0_keys=227/256 v_saved= 38/ 64 mean_row_cos=0.99931
+sharp thr=4 fused=0 causal=0 mode=2            cycles= 411 p0_keys=227/256 v_saved= 38/ 64 mean_row_cos=0.99930
+sharp thr=4 fused=1 causal=0 mode=0            cycles= 111 p0_keys=191/256 v_saved= 27/ 64 mean_row_cos=0.99971
+sharp thr=4 fused=1 causal=0 mode=2            cycles= 111 p0_keys=191/256 v_saved= 27/ 64 mean_row_cos=0.99970
+sharp thr=4 fused=1 causal=1 mode=0            cycles=  97 p0_keys= 85/136 v_saved= 13/ 40 mean_row_cos=0.99978
+sharp thr=4 fused=1 causal=1 mode=2            cycles=  97 p0_keys= 85/136 v_saved= 13/ 40 mean_row_cos=0.99973
+sharp thr=2 fused=0 causal=0 mode=0            cycles= 411 p0_keys=234/256 v_saved= 45/ 64 mean_row_cos=0.99469
+sharp thr=2 fused=0 causal=0 mode=2            cycles= 411 p0_keys=234/256 v_saved= 45/ 64 mean_row_cos=0.99461
+sharp thr=2 fused=1 causal=0 mode=0            cycles= 111 p0_keys=201/256 v_saved= 33/ 64 mean_row_cos=0.99835
+sharp thr=2 fused=1 causal=0 mode=2            cycles= 111 p0_keys=201/256 v_saved= 33/ 64 mean_row_cos=0.99830
+sharp thr=2 fused=1 causal=1 mode=0            cycles=  97 p0_keys= 94/136 v_saved= 18/ 40 mean_row_cos=0.99189
+sharp thr=2 fused=1 causal=1 mode=2            cycles=  97 p0_keys= 94/136 v_saved= 18/ 40 mean_row_cos=0.99202
+outliers thr=0 fused=0 causal=0 mode=0         cycles= 411 p0_keys=164/256 v_saved= 13/ 64 mean_row_cos=0.99871
+outliers thr=0 fused=0 causal=0 mode=2         cycles= 411 p0_keys=162/256 v_saved= 13/ 64 mean_row_cos=0.99766
+outliers thr=0 fused=1 causal=0 mode=0         cycles= 111 p0_keys=115/256 v_saved= 10/ 64 mean_row_cos=0.99846
+outliers thr=0 fused=1 causal=0 mode=2         cycles= 111 p0_keys=113/256 v_saved= 10/ 64 mean_row_cos=0.99761
+outliers thr=0 fused=1 causal=1 mode=0         cycles=  97 p0_keys= 34/136 v_saved=  2/ 40 mean_row_cos=0.99919
+outliers thr=0 fused=1 causal=1 mode=2         cycles=  97 p0_keys= 33/136 v_saved=  2/ 40 mean_row_cos=0.99815
+outliers thr=6 fused=0 causal=0 mode=0         cycles= 411 p0_keys=179/256 v_saved= 15/ 64 mean_row_cos=0.98858
+outliers thr=6 fused=0 causal=0 mode=2         cycles= 411 p0_keys=179/256 v_saved= 15/ 64 mean_row_cos=0.98849
+outliers thr=6 fused=1 causal=0 mode=0         cycles= 111 p0_keys=132/256 v_saved= 12/ 64 mean_row_cos=0.99719
+outliers thr=6 fused=1 causal=0 mode=2         cycles= 111 p0_keys=132/256 v_saved= 12/ 64 mean_row_cos=0.99630
+outliers thr=6 fused=1 causal=1 mode=0         cycles=  97 p0_keys= 46/136 v_saved=  3/ 40 mean_row_cos=0.99756
+outliers thr=6 fused=1 causal=1 mode=2         cycles=  97 p0_keys= 46/136 v_saved=  3/ 40 mean_row_cos=0.99647
+outliers thr=4 fused=0 causal=0 mode=0         cycles= 411 p0_keys=205/256 v_saved= 30/ 64 mean_row_cos=0.91741
+outliers thr=4 fused=0 causal=0 mode=2         cycles= 411 p0_keys=205/256 v_saved= 30/ 64 mean_row_cos=0.91717
+outliers thr=4 fused=1 causal=0 mode=0         cycles= 111 p0_keys=155/256 v_saved= 19/ 64 mean_row_cos=0.93286
+outliers thr=4 fused=1 causal=0 mode=2         cycles= 111 p0_keys=155/256 v_saved= 19/ 64 mean_row_cos=0.93263
+outliers thr=4 fused=1 causal=1 mode=0         cycles=  97 p0_keys= 63/136 v_saved=  9/ 40 mean_row_cos=0.93162
+outliers thr=4 fused=1 causal=1 mode=2         cycles=  97 p0_keys= 63/136 v_saved=  9/ 40 mean_row_cos=0.93097
+outliers thr=2 fused=0 causal=0 mode=0         cycles= 411 p0_keys=224/256 v_saved= 39/ 64 mean_row_cos=0.89909
+outliers thr=2 fused=0 causal=0 mode=2         cycles= 411 p0_keys=224/256 v_saved= 39/ 64 mean_row_cos=0.89819
+outliers thr=2 fused=1 causal=0 mode=0         cycles= 111 p0_keys=179/256 v_saved= 24/ 64 mean_row_cos=0.90481
+outliers thr=2 fused=1 causal=0 mode=2         cycles= 111 p0_keys=179/256 v_saved= 24/ 64 mean_row_cos=0.90385
+outliers thr=2 fused=1 causal=1 mode=0         cycles=  97 p0_keys= 75/136 v_saved= 10/ 40 mean_row_cos=0.86164
+outliers thr=2 fused=1 causal=1 mode=2         cycles=  97 p0_keys= 75/136 v_saved= 10/ 40 mean_row_cos=0.86102

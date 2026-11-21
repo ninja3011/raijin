@@ -9,6 +9,17 @@
 // Online mode        : s_valid, m_update, emit    (max, exp, rescale every key)
 //
 // recip_start launches floor(2^19 / l), done 13 cycles later (r_valid).
+//
+// Group pipelining (fused dataflow): first marks the first key of a new query
+// group and restarts m and l without a clear cycle, so the next group can
+// stream right behind the previous one. last marks a group's final key: the
+// lane latches the final l and starts the reciprocal on its own, so the next
+// group's keys can update l while the division runs. Both are 0 elsewhere.
+// mask (causal pass) passes a key through without touching m or l and with
+// p = 0, so the accumulators skip it; out_mask tells the core not to count it
+// as an underflow skip.
+// thr (key skip, 0 = off): a key whose score lies thr or more powers of two
+// below the running max gets p = 0 (and no MF terms), like an underflow.
 `default_nettype none
 module raijin_softmax_lane #(
     parameter TW = 8
@@ -22,6 +33,10 @@ module raijin_softmax_lane #(
     input  wire [TW-1:0]     tag,
     input  wire              m_update,
     input  wire              emit,
+    input  wire              first,      // first key of a group (restart m, l)
+    input  wire              last,       // last key of a group (auto reciprocal)
+    input  wire              mask,       // key masked for this row (causal)
+    input  wire [3:0]        thr,        // key-skip threshold (0 = off)
     // stage B outputs
     output reg               out_valid,
     output reg  [TW-1:0]     out_tag,
@@ -29,6 +44,9 @@ module raijin_softmax_lane #(
     output reg  [3:0]        out_sa,
     output reg  [3:0]        out_sb,
     output wire [4:0]        out_delta,
+    output reg               out_first,
+    output reg               out_last,
+    output reg               out_mask,
     // state
     output reg  signed [8:0] m,
     output reg  [12:0]       l,
@@ -40,14 +58,16 @@ module raijin_softmax_lane #(
     // ---------------- stage A ----------------
     wire signed [12:0] s_p15 = $signed(s) + 13'sd15;
     wire signed [8:0]  mc    = s_p15 >>> 4;
-    wire signed [8:0]  mn    = (m_update && (mc > m)) ? mc : m;
-    wire        [9:0]  dlt   = $signed({mn[8], mn}) - $signed({m[8], m});
+    wire signed [8:0]  m_b   = first ? -9'sd256 : m;    // m before this key
+    wire signed [8:0]  mn    = (m_update && !mask && (mc > m_b)) ? mc : m_b;
+    wire        [9:0]  dlt   = $signed({mn[8], mn}) - $signed({m_b[8], m_b});
 
     reg               a_valid;
     reg  [TW-1:0]     a_tag;
     reg signed [11:0] a_s;
     reg signed [8:0]  a_m;
     reg        [9:0]  a_delta;
+    reg               a_first, a_last, a_mask;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -67,6 +87,9 @@ module raijin_softmax_lane #(
         a_s     <= s;
         a_m     <= mn;
         a_delta <= dlt;
+        a_first <= first;
+        a_last  <= last;
+        a_mask  <= mask;
     end
 
     // ---------------- stage B ----------------
@@ -75,7 +98,15 @@ module raijin_softmax_lane #(
     raijin_exp2 u_exp (.s(a_s), .m(a_m), .mode(mode), .p(p), .sa(sa), .sb(sb));
 
     wire [4:0]  dsh = (a_delta > 10'd31) ? 5'd31 : a_delta[4:0];
-    wire [12:0] l_sh = l >> dsh;
+    wire [12:0] l_b  = a_first ? 13'd0 : l;              // l before this key
+    wire [12:0] l_sh = l_b >> dsh;
+    wire signed [14:0] t_k  = ($signed(a_m) <<< 4) - $signed(a_s);
+    wire        prune = (thr != 4'd0) && (t_k[14:4] >= {7'd0, thr});
+    wire        zero  = a_mask || prune;
+    wire [8:0]  p_e  = zero ? 9'd0 : p;                   // masked / pruned: nothing
+    wire [12:0] l_nx = l_sh + {4'd0, p_e};
+    reg         auto_go;                                  // reciprocal of l_fin
+    reg  [12:0] l_fin;
     reg  [4:0]  b_delta;
     assign out_delta = b_delta;
 
@@ -83,29 +114,39 @@ module raijin_softmax_lane #(
         if (!rst_n) begin
             out_valid <= 1'b0;
             l         <= 13'd0;
+            auto_go   <= 1'b0;
         end else if (clear) begin
             out_valid <= 1'b0;
             l         <= 13'd0;
+            auto_go   <= 1'b0;
         end else begin
             out_valid <= a_valid;
-            if (a_valid) l <= l_sh + {4'd0, p};
+            auto_go   <= a_valid && a_last;
+            if (a_valid) l <= l_nx;
         end
+    end
+    always @(posedge clk) begin
+        if (a_valid && a_last) l_fin <= l_nx;
     end
 
     always @(posedge clk) begin
         out_tag <= a_tag;
-        out_p   <= p;
-        out_sa  <= sa;
-        out_sb  <= sb;
+        out_p   <= p_e;
+        out_sa  <= zero ? 4'd15 : sa;
+        out_sb  <= zero ? 4'd15 : sb;
         b_delta <= dsh;
+        out_first <= a_valid && a_first;
+        out_last  <= a_valid && a_last;
+        out_mask  <= a_valid && a_mask;
     end
 
     // ---------------- reciprocal: floor(2^19 / l), l >= 128 ----------------
     reg [13:0] rem;
     reg [3:0]  cnt;
     reg        busy;
+    reg [12:0] l_div;                 // divisor, latched at the start
     wire [14:0] rem2 = {rem, 1'b0};
-    wire        ge   = rem2 >= {2'b00, l};
+    wire        ge   = rem2 >= {2'b00, l_div};
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             busy    <= 1'b0;
@@ -113,14 +154,15 @@ module raijin_softmax_lane #(
             r       <= 13'd0;
             rem     <= 14'd0;
             cnt     <= 4'd0;
-        end else if (recip_start) begin
+        end else if (recip_start || auto_go) begin
+            l_div   <= auto_go ? l_fin : l;
             busy    <= 1'b1;
             r_valid <= 1'b0;
             rem     <= 14'd64;
             cnt     <= 4'd12;
             r       <= 13'd0;
         end else if (busy) begin
-            rem <= ge ? (rem2 - {2'b00, l}) : rem2[13:0];
+            rem <= ge ? (rem2 - {2'b00, l_div}) : rem2[13:0];
             r   <= {r[11:0], ge};
             if (cnt == 4'd0) begin
                 busy    <= 1'b0;

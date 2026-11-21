@@ -83,14 +83,18 @@ def term(sh: int) -> int:
     return 0 if sh > 8 else 256 >> sh
 
 
-def exp2(s: int, m: int, mode: int) -> Tuple[int, int, int]:
+def exp2(s: int, m: int, mode: int, thr: int = 0) -> Tuple[int, int, int]:
     """p = 2^(s/16 - m) in Q1.8 plus the two shift codes used by the AV path.
 
     Returns (p, sa, sb). In exact mode sa/sb are unused (returned as NONE_CODE).
+    thr (key-skip threshold, 0 = off): a key whose score is thr or more
+    powers of two below the running max gets p = 0 and is skipped.
     """
     t = m * 16 - s
     assert t >= 0
     k, f = t >> 4, t & 15
+    if thr and k >= thr:
+        return 0, NONE_CODE, NONE_CODE
     if mode == MODE_EXACT:
         p = 0 if k >= 9 else EXP_LUT[f] >> k
         return p, NONE_CODE, NONE_CODE
@@ -144,10 +148,29 @@ class PassResult:
     skips: int = 0
     l: List[int] = field(default_factory=list)
     scores: np.ndarray | None = None
+    used: np.ndarray | None = None   # (rows, keys) bool: key j added to row i
+
+
+def v_reads_saved(used: np.ndarray, p: int, causal: bool = False) -> int:
+    """V-row reads the RTL saves: one per (group, key) beat in which no row of
+    the P-row group uses the key. A causal pass streams group g only up to
+    key g*P+P-1."""
+    n_rows, n_keys = used.shape
+    saved = 0
+    for g in range(n_rows // p):
+        last = g * p + p - 1 if causal else n_keys - 1
+        for j in range(last + 1):
+            if not used[g * p:(g + 1) * p, j].any():
+                saved += 1
+    return saved
 
 
 def attention(q, eq, k, ek, v, ev, *, fused: bool, mode: int = MODE_EXACT,
-              offset: int = 0) -> PassResult:
+              offset: int = 0, causal: bool = False, thr: int = 0) -> PassResult:
+    """Full attention pass. causal (fused only): row i sees keys 0..i; masked
+    keys are not processed at all (and not counted as skips). e_vmax is still
+    taken over all N V rows, as in the RTL."""
+    assert fused or not causal
     q, k, v = (np.asarray(a, dtype=np.int64) for a in (q, k, v))
     eq, ek, ev = (np.asarray(a, dtype=np.int64) for a in (eq, ek, ev))
     n, d = q.shape
@@ -158,6 +181,7 @@ def attention(q, eq, k, ek, v, ev, *, fused: bool, mode: int = MODE_EXACT,
     skips = 0
     ls = []
     scores = np.zeros((n, n), dtype=np.int64)
+    used = np.zeros((n, n), dtype=bool)
     for i in range(n):
         s = [requant(dpu(q[i], k[j]), int(eq[i]) + int(ek[j]), offset) for j in range(n)]
         scores[i] = s
@@ -165,14 +189,15 @@ def attention(q, eq, k, ek, v, ev, *, fused: bool, mode: int = MODE_EXACT,
         lsum = 0
         if fused:
             m = M_INIT
-            for j in range(n):
+            for j in range(i + 1 if causal else n):
                 mn = max(m, ceil_int(s[j]))
                 delta = mn - m
                 m = mn
-                p, _, _ = exp2(s[j], m, mode)
+                p, _, _ = exp2(s[j], m, mode, thr)
                 if p == 0:
                     skips += 1          # delta is always 0 here
                     continue
+                used[i, j] = True
                 dsh = min(delta, 31)
                 lsum = (lsum >> dsh) + p
                 for c in range(d):
@@ -182,10 +207,11 @@ def attention(q, eq, k, ek, v, ev, *, fused: bool, mode: int = MODE_EXACT,
             for j in range(n):
                 m = max(m, ceil_int(s[j]))
             for j in range(n):
-                p, _, _ = exp2(s[j], m, mode)
+                p, _, _ = exp2(s[j], m, mode, thr)
                 if p == 0:
                     skips += 1
                     continue
+                used[i, j] = True
                 lsum += p
                 for c in range(d):
                     acc[c] += pv_term(p, v[j][c], dvs[j])
@@ -196,11 +222,12 @@ def attention(q, eq, k, ek, v, ev, *, fused: bool, mode: int = MODE_EXACT,
         row, e = out_row(acc, recip(lsum), emax)
         o[i] = row
         eo[i] = e
-    return PassResult(o=o, eo=eo, skips=skips, l=ls, scores=scores)
+    return PassResult(o=o, eo=eo, skips=skips, l=ls, scores=scores, used=used)
 
 
 def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
-                     mode: int = MODE_EXACT, offset: int = 0) -> PassResult:
+                     mode: int = MODE_EXACT, offset: int = 0,
+                     emax_len: int | None = None, thr: int = 0) -> PassResult:
     """One KV-cache decode step: query row `qrow` attends to keys 0..length-1.
 
     This is the fused (online softmax) pass for one query over a key prefix.
@@ -210,7 +237,7 @@ def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
     q, k, v = (np.asarray(a, dtype=np.int64) for a in (q, k, v))
     eq, ek, ev = (np.asarray(a, dtype=np.int64) for a in (eq, ek, ev))
     d = q.shape[1]
-    emax = int(ev[:length].max())
+    emax = int(ev[:length if emax_len is None else emax_len].max())
     s = [requant(dpu(q[qrow], k[j]), int(eq[qrow]) + int(ek[j]), offset) for j in range(length)]
     acc = [0] * d
     lsum, m, skips = 0, M_INIT, 0
@@ -218,7 +245,7 @@ def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
         mn = max(m, ceil_int(s[j]))
         delta = mn - m
         m = mn
-        p, _, _ = exp2(s[j], m, mode)
+        p, _, _ = exp2(s[j], m, mode, thr)
         if p == 0:
             skips += 1
             continue
@@ -232,6 +259,29 @@ def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
                       skips=skips, l=[lsum])
 
 
+def attention_decode_multi(q, eq, k, ek, v, ev, *, group: int, p: int, length: int,
+                           spec: bool = False, mode: int = MODE_EXACT,
+                           offset: int = 0, thr: int = 0) -> PassResult:
+    """Multi-query decode step: the p query rows of `group` (rows group*p ..
+    group*p+p-1) attend to the cached keys in one step, as the RTL does.
+
+    GQA / MQA (spec=False): every row sees keys 0..length-1.
+    Speculative verify (spec=True): the rows are p draft tokens whose K/V are
+    the last p cached rows; row r sees keys 0..length-p+r.
+    e_vmax is over the length cached V rows for every row."""
+    rows, eos, ls, skips = [], [], [], 0
+    for r in range(p):
+        n_keys = length - p + r + 1 if spec else length
+        res = attention_decode(q, eq, k, ek, v, ev, qrow=group * p + r, length=n_keys,
+                               mode=mode, offset=offset, emax_len=length, thr=thr)
+        rows.append(res.o[0])
+        eos.append(res.eo[0])
+        ls += res.l
+        skips += res.skips
+    return PassResult(o=np.array(rows, dtype=np.int64), eo=np.array(eos, dtype=np.int64),
+                      skips=skips, l=ls)
+
+
 def _check_decode_matches_fused(rng) -> None:
     """With length = N, decode of row i must equal row i of the fused pass."""
     qf, kf, vf = random_case(rng, scale=1.5)
@@ -240,6 +290,28 @@ def _check_decode_matches_fused(rng) -> None:
     for i in range(qf.shape[0]):
         r = attention_decode(*args, qrow=i, length=qf.shape[0])
         assert np.array_equal(r.o[0], full.o[i]) and r.eo[0] == full.eo[i], i
+
+
+def streaming_slot(t: int, n: int, sinks: int) -> int:
+    """KV-cache row for token t in a StreamingLLM-style cache of n rows: the
+    first `sinks` tokens stay pinned (attention sinks), and the other n - sinks
+    rows form a ring that always holds the most recent tokens."""
+    if t < n:
+        return t
+    return sinks + (t - sinks) % (n - sinks)
+
+
+def reference_streaming(qf, kf, vf, n: int, sinks: int):
+    """FP32 attention for every token t over the keys a streaming cache of n
+    rows holds at step t: tokens 0..sinks-1 plus the last n - sinks tokens."""
+    out = []
+    for t in range(qf.shape[0]):
+        keys = list(range(t + 1)) if t < n else \
+            list(range(sinks)) + list(range(t - (n - sinks) + 1, t + 1))
+        s = qf[t] @ kf[keys].T / np.sqrt(qf.shape[1])
+        p = np.exp(s - s.max())
+        out.append((p / p.sum()) @ vf[keys])
+    return np.array(out)
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +334,39 @@ def mx_quantize(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         q[i] = np.clip(np.round(row / 2.0 ** ex * 64), -128, 127)
         e[i] = ex + EXP_BIAS
     return q, e
+
+
+def mx_quantize4(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Quantise each row to MXINT4: INT4 elements in [-8, 7] with 2 fraction
+    bits and one shared E8M0 exponent per row. Returns the elements as the
+    INT8 datapath sees them (x4 << 4), so the INT8 golden model applies as is,
+    together with the exponents."""
+    x = np.asarray(x, dtype=np.float64)
+    q4 = np.zeros(x.shape, dtype=np.int64)
+    e = np.zeros(x.shape[0], dtype=np.int64)
+    for i, row in enumerate(x):
+        amax = float(np.max(np.abs(row)))
+        ex = 0 if amax == 0 else int(np.ceil(np.log2(amax * 4 / 7)))
+        ex = min(max(ex, -127), 128)
+        q4[i] = np.clip(np.round(row / 2.0 ** ex * 4), -8, 7)
+        e[i] = ex + EXP_BIAS
+    return q4 * 16, e
+
+
+def pack4(row8: Sequence[int]) -> List[int]:
+    """Pack one MXINT4 row (given as x4 << 4) into 8 bytes: element 2b in the
+    low nibble of byte b, element 2b+1 in the high nibble."""
+    n = [(int(x) >> 4) & 0xF for x in row8]
+    return [n[2 * b] | (n[2 * b + 1] << 4) for b in range(len(n) // 2)]
+
+
+def prepare_kv4(qf, kf, vf):
+    """Like prepare(), but K and V in MXINT4 (returned as x4 << 4)."""
+    d = qf.shape[1]
+    q, eq = mx_quantize(qf * (np.log2(np.e) / np.sqrt(d)))
+    k, ek = mx_quantize4(kf)
+    v, ev = mx_quantize4(vf)
+    return q, eq, k, ek, v, ev
 
 
 def mx_dequantize(q: np.ndarray, e: np.ndarray) -> np.ndarray:
@@ -296,6 +401,57 @@ def reference_causal(qf, kf, vf):
     p = np.exp(s)
     p /= p.sum(axis=1, keepdims=True)
     return p @ vf
+
+
+# ---------------------------------------------------------------------------
+# RoPE on write (feature 9)
+# ---------------------------------------------------------------------------
+# Pair i = elements (2i, 2i+1) turns by pos * theta_i, theta_i = 10000^(-2i/d).
+# Phase is in turns, Q0.20: ROPE_W[i] = round(2^20 * theta_i / (2 pi)).
+ROPE_W = [166886, 52774, 16689, 5277, 1669, 528, 167, 53]
+# quarter-wave sine, Q1.8: ROPE_SIN[k] = round(256 * sin(2 pi k / 1024)), k = 0..256
+ROPE_SIN = [int(round(256 * np.sin(2 * np.pi * k / 1024))) for k in range(257)]
+
+
+def rope_cs(pos: int, i: int) -> Tuple[int, int]:
+    """(cos, sin) in Q1.8 for pair i at position pos, as the RTL computes it."""
+    ph = (pos * ROPE_W[i]) & 0xFFFFF
+    a = ((ph + (1 << 9)) >> 10) & 1023          # 10-bit phase, rounded
+    q, k = a >> 8, a & 255
+    s0, c0 = ROPE_SIN[k], ROPE_SIN[256 - k]
+    return [(c0, s0), (-s0, c0), (-c0, -s0), (s0, -c0)][q]
+
+
+def rope_row(row: Sequence[int], pos: int) -> List[int]:
+    """Rotate one INT8 row as the write-path rotator does: round, then
+    saturate to INT8. The row keeps its exponent."""
+    out = []
+    for i in range(len(row) // 2):
+        x, y = int(row[2 * i]), int(row[2 * i + 1])
+        c, s = rope_cs(pos, i)
+        out += [_sat((x * c - y * s + 128) >> 8, 8), _sat((x * s + y * c + 128) >> 8, 8)]
+    return out
+
+
+def rope_float(x: np.ndarray, pos: Sequence[int]) -> np.ndarray:
+    """Exact (float) RoPE, interleaved pairs, for the FP32 reference."""
+    x = np.array(x, dtype=np.float64)
+    d = x.shape[1]
+    th = 10000.0 ** (-2 * np.arange(d // 2) / d)
+    for r, p in enumerate(pos):
+        a = p * th
+        c, s = np.cos(a), np.sin(a)
+        x0, x1 = x[r, 0::2].copy(), x[r, 1::2].copy()
+        x[r, 0::2] = x0 * c - x1 * s
+        x[r, 1::2] = x0 * s + x1 * c
+    return x
+
+
+def rope_quantized(m: np.ndarray, e: np.ndarray, pos: Sequence[int]):
+    """What the chip stores for rows written with RoPE on: rotated elements,
+    same exponents."""
+    out = np.array([rope_row(m[r], pos[r]) for r in range(m.shape[0])], dtype=np.int64)
+    return out, np.asarray(e, dtype=np.int64)
 
 
 def random_case(rng: np.random.Generator, n=16, d=16, scale=1.0, outliers=False):

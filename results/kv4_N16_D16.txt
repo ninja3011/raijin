@@ -1,0 +1,5 @@
+kv4 full fused=0 causal=0          cycles= 411 cos=0.95457
+kv4 full fused=1 causal=0          cycles= 111 cos=0.95455
+kv4 decode random   tokens=32 cycles@len32= 66 mean cos INT4=0.98307 (INT8 cache, model=0.99984)
+kv4 decode sharp    tokens=32 cycles@len32= 66 mean cos INT4=0.96525 (INT8 cache, model=0.99975)
+kv4 decode outliers tokens=32 cycles@len32= 66 mean cos INT4=0.97689 (INT8 cache, model=0.99960)
