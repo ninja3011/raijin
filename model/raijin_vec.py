@@ -58,8 +58,11 @@ def _bitlen(y):
     return nb
 
 
-def decode_causal(q, eq, k, ek, v, ev, mode=rm.MODE_EXACT, thr=0, offset=0, stats=None):
-    """q, k, v: int arrays (..., T, D); eq, ek, ev: (..., T). Returns (o, eo)."""
+def decode_causal(q, eq, k, ek, v, ev, mode=rm.MODE_EXACT, thr=0, offset=0, stats=None, final_max=False):
+    """q, k, v: int arrays (..., T, D); eq, ek, ev: (..., T). Returns (o, eo).
+    final_max: start every row's running maximum at its final value (a score
+    pass that finds the maximum before any weight is formed), so SKIPTHR is
+    measured against the true maximum."""
     q, k, v = (np.asarray(a, dtype=np.int64) for a in (q, k, v))
     eq, ek, ev = (np.asarray(a, dtype=np.int64) for a in (eq, ek, ev))
     T, D = q.shape[-2], q.shape[-1]
@@ -67,6 +70,9 @@ def decode_causal(q, eq, k, ek, v, ev, mode=rm.MODE_EXACT, thr=0, offset=0, stat
     emax = np.maximum.accumulate(ev, axis=-1)              # e_vmax over keys 0..i
     lead = q.shape[:-2]
     m = np.full(lead + (T,), rm.M_INIT, dtype=np.int64)
+    if final_max:
+        c = np.where(np.tril(np.ones((T, T), dtype=bool)), (S + 15) >> 4, rm.M_INIT)
+        m = np.maximum(c.max(axis=-1), rm.M_INIT)
     l = np.zeros(lead + (T,), dtype=np.int64)
     acc = np.zeros(lead + (T, D), dtype=np.int64)
     qi = np.arange(T)

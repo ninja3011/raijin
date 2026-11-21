@@ -1,13 +1,19 @@
 char LM: 4 layers, d_model 128, 8 heads x 16, RoPE, context 32; 256 validation sequences of Tiny Shakespeare (8192 predicted characters)
-FP32 attention                           ppl=4.6230 (+0.00%) top1=0.5458 zero-weight keys=0.0%
-Raijin MXINT8, exact exp                 ppl=4.6300 (+0.15%) top1=0.5460 zero-weight keys=15.1%
-Raijin MXINT8, MF1 (one shift)           ppl=4.6417 (+0.40%) top1=0.5436 zero-weight keys=13.8%
-Raijin MXINT8, MF2 (two shifts)          ppl=4.6321 (+0.19%) top1=0.5455 zero-weight keys=14.4%
-Raijin MXINT8, key skip SKIPTHR=6        ppl=4.6310 (+0.17%) top1=0.5447 zero-weight keys=24.7%
-Raijin MXINT8, key skip SKIPTHR=4        ppl=4.6384 (+0.33%) top1=0.5422 zero-weight keys=37.8%
-Raijin MXINT8, key skip SKIPTHR=2        ppl=4.7445 (+2.63%) top1=0.5386 zero-weight keys=54.1%
-Raijin K INT8, V INT4                    ppl=4.6533 (+0.65%) top1=0.5433 zero-weight keys=15.0%
-Raijin K INT4, V INT4                    ppl=4.8043 (+3.92%) top1=0.5343 zero-weight keys=15.8%
-Raijin INT4 + INT8 sink & worst page     ppl=4.7324 (+2.36%) top1=0.5359 zero-weight keys=15.5%
-Raijin K INT8, V INT4, SKIPTHR=6         ppl=4.6564 (+0.72%) top1=0.5416 zero-weight keys=24.6%
-Raijin operating point: MF2, K8 V4, SKIPTHR=6 ppl=4.6625 (+0.85%) top1=0.5420 zero-weight keys=24.6%
+FP32 attention                                 ppl=4.8515 (+0.00%) bpc=2.2784 top1=0.5281 zero-weight keys=0.0% l-wraps=0
+Raijin MXINT8, exact exp                       ppl=4.8588 (+0.15%) bpc=2.2806 top1=0.5277 zero-weight keys=15.1% l-wraps=0
+Raijin MXINT8, MF1 (one shift)                 ppl=4.8702 (+0.39%) bpc=2.2840 top1=0.5280 zero-weight keys=13.8% l-wraps=0
+Raijin MXINT8, MF2 (two shifts)                ppl=4.8551 (+0.07%) bpc=2.2795 top1=0.5278 zero-weight keys=14.4% l-wraps=0
+Raijin MXINT8, key skip SKIPTHR=6              ppl=4.8587 (+0.15%) bpc=2.2806 top1=0.5283 zero-weight keys=24.7% l-wraps=0
+Raijin MXINT8, key skip SKIPTHR=4              ppl=4.8814 (+0.62%) bpc=2.2873 top1=0.5271 zero-weight keys=37.9% l-wraps=0
+Raijin MXINT8, key skip SKIPTHR=2              ppl=5.0047 (+3.16%) bpc=2.3233 top1=0.5200 zero-weight keys=54.2% l-wraps=0
+Raijin K INT8, V INT4                          ppl=4.8907 (+0.81%) bpc=2.2900 top1=0.5258 zero-weight keys=15.0% l-wraps=0
+Raijin K INT4, V INT4                          ppl=5.0130 (+3.33%) bpc=2.3257 top1=0.5182 zero-weight keys=15.7% l-wraps=0
+Raijin K INT8, V MXFP4                         ppl=4.8827 (+0.64%) bpc=2.2877 top1=0.5262 zero-weight keys=15.1% l-wraps=0
+Raijin K MXFP4, V MXFP4                        ppl=4.9782 (+2.61%) bpc=2.3156 top1=0.5204 zero-weight keys=15.4% l-wraps=0
+Raijin K INT4, V MXFP4                         ppl=4.9958 (+2.98%) bpc=2.3207 top1=0.5211 zero-weight keys=15.8% l-wraps=0
+Raijin INT4 + INT8 sink & worst page           ppl=4.9746 (+2.54%) bpc=2.3146 top1=0.5219 zero-weight keys=15.5% l-wraps=0
+Raijin K INT8, V INT4, SKIPTHR=6               ppl=4.8915 (+0.83%) bpc=2.2903 top1=0.5244 zero-weight keys=24.6% l-wraps=0
+Raijin operating point: MF2, K8 V4, SKIPTHR=6  ppl=4.8863 (+0.72%) bpc=2.2887 top1=0.5248 zero-weight keys=24.6% l-wraps=0
+Raijin MF2, K8 V-MXFP4, SKIPTHR=6              ppl=4.8796 (+0.58%) bpc=2.2868 top1=0.5261 zero-weight keys=24.7% l-wraps=0
+Raijin max-first decode, MF2                   ppl=4.8579 (+0.13%) bpc=2.2803 top1=0.5286 zero-weight keys=63.9% l-wraps=0
+Raijin operating point + max-first decode      ppl=4.8826 (+0.64%) bpc=2.2877 top1=0.5244 zero-weight keys=74.1% l-wraps=0

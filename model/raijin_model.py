@@ -227,8 +227,14 @@ def attention(q, eq, k, ek, v, ev, *, fused: bool, mode: int = MODE_EXACT,
 
 def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
                      mode: int = MODE_EXACT, offset: int = 0,
-                     emax_len: int | None = None, thr: int = 0) -> PassResult:
+                     emax_len: int | None = None, thr: int = 0,
+                     final_max: bool = False) -> PassResult:
     """One KV-cache decode step: query row `qrow` attends to keys 0..length-1.
+
+    final_max (max-first decode, feature 17): the running maximum starts at the
+    row's final maximum, as when a score pass finds it before any weight is
+    formed. No rescale then happens, and every key whose weight underflows
+    against the true maximum is skipped.
 
     This is the fused (online softmax) pass for one query over a key prefix.
     e_vmax is taken over the cached V rows only, as in the RTL. The result
@@ -241,6 +247,8 @@ def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
     s = [requant(dpu(q[qrow], k[j]), int(eq[qrow]) + int(ek[j]), offset) for j in range(length)]
     acc = [0] * d
     lsum, m, skips = 0, M_INIT, 0
+    if final_max:
+        m = max(M_INIT, max(ceil_int(x) for x in s))
     for j in range(length):
         mn = max(m, ceil_int(s[j]))
         delta = mn - m
@@ -257,6 +265,51 @@ def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
     row, e = out_row(acc, recip(lsum), emax)
     return PassResult(o=np.array([row], dtype=np.int64), eo=np.array([e], dtype=np.int64),
                       skips=skips, l=[lsum])
+
+
+def decode_scores(q, eq, k, ek, *, qrow: int, length: int, offset: int = 0):
+    """The Q7.4 scores of one decode step (what the softmax lane sees)."""
+    q, k = np.asarray(q, dtype=np.int64), np.asarray(k, dtype=np.int64)
+    return [requant(dpu(q[qrow], k[j]), int(eq[qrow]) + int(ek[j]), offset) for j in range(length)]
+
+
+HH_NK = 32
+
+
+def hh_step(acc, scores, slots, skip=0, recent=0):
+    """Heavy-hitter tracker (rtl/raijin_hh.v) after one single-row decode step.
+
+    acc: list of HH_NK 16-bit accumulators (updated in place); scores[i] is the
+    score of the key held in physical slot slots[i]. Each key adds its
+    max-normalised weight 2^((s - 16 m) / 16) in Q0.8, as
+    (frac >= 1/2 ? 181 : 256) >> floor((16 m - s) / 16), 0 below 2^-8, where m
+    is the row's final running maximum. Returns the eviction candidate: the
+    slot >= skip with the smallest accumulator among this step's slots (lowest
+    index on ties). Keys among the step's newest `recent` positions are never
+    chosen (H2O keeps a recent window)."""
+    m = M_INIT
+    for sj in scores:
+        m = max(m, ceil_int(sj))
+    used, rec = {}, set()
+    n = len(scores)
+    for j, (sj, sl) in enumerate(zip(scores, slots)):
+        used[sl] = sj
+        if j + recent >= n:
+            rec.add(sl)
+    best, best_k = 1 << 17, 0
+    for sl in range(HH_NK):
+        if sl not in used:
+            continue
+        d = 16 * m - used[sl]
+        if d < 0:
+            w = 256
+        else:
+            di = d >> 4
+            w = 0 if di > 8 else ((181 if d & 8 else 256) >> di)
+        acc[sl] = min(acc[sl] + w, 0xFFFF)
+        if sl >= skip and sl not in rec and acc[sl] < best:
+            best, best_k = acc[sl], sl
+    return best_k
 
 
 def attention_decode_multi(q, eq, k, ek, v, ev, *, group: int, p: int, length: int,
@@ -358,6 +411,67 @@ def pack4(row8: Sequence[int]) -> List[int]:
     low nibble of byte b, element 2b+1 in the high nibble."""
     n = [(int(x) >> 4) & 0xF for x in row8]
     return [n[2 * b] | (n[2 * b + 1] << 4) for b in range(len(n) // 2)]
+
+
+# MXFP4 (OCP MX, E2M1 elements): nibble s e1 e0 m. Twice the value is an
+# integer, 2|x| in {0, 1, 2, 3, 4, 6, 8, 12}, so the chip widens a nibble to
+# INT8 as +-(2|x|) << 3 = 16 x, the same scale as an MXINT4 element x4 << 4.
+FP4_MAG2 = (0, 1, 2, 3, 4, 6, 8, 12)          # 2|x| for codes 0..7
+FP4_GRID = np.array(sorted({s * m / 2 for m in FP4_MAG2 for s in (1, -1)}))
+
+
+def fp4_code8(nib: int) -> int:
+    """INT8 element the datapath sees for one E2M1 nibble (16 x)."""
+    mag = FP4_MAG2[nib & 7] << 3
+    return -mag if nib & 8 else mag
+
+
+def mx_quantize_fp4(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Quantise each row to MXFP4: E2M1 elements (|x| <= 6) and one shared E8M0
+    exponent per row. The host tries the exponent at which the row maximum just
+    fits (|x| <= 6) and the one below it (the maximum then clips to 6, the
+    other elements get a finer grid) and keeps the one with the lower squared
+    error; the chip only sees the exponent, so this choice is free.
+    Elements are returned as the INT8 datapath sees them (16 x), with the
+    exponents; a value is then 16 x / 64 * 2^(e - bias), as for MXINT4."""
+    x = np.asarray(x, dtype=np.float64)
+    q = np.zeros(x.shape, dtype=np.int64)
+    e = np.zeros(x.shape[0], dtype=np.int64)
+    for i, row in enumerate(x):
+        amax = float(np.max(np.abs(row)))
+        ex0 = 0 if amax == 0 else int(np.ceil(np.log2(amax * 4 / 6)))
+        best = None
+        for ex in (ex0, ex0 - 1):            # host picks the lower-error exponent
+            ex = min(max(ex, -127), 128)
+            y = row / 2.0 ** ex * 4
+            g = FP4_GRID[np.abs(y[:, None] - FP4_GRID[None, :]).argmin(axis=1)]
+            err = float(np.sum((g / 4 * 2.0 ** ex - row) ** 2))
+            if best is None or err < best[0]:
+                best = (err, g, ex)
+        q[i] = np.round(best[1] * 16).astype(np.int64)
+        e[i] = best[2] + EXP_BIAS
+    return q, e
+
+
+def fp4_nibble(c8: int) -> int:
+    """E2M1 nibble of an INT8 element 16 x (inverse of fp4_code8)."""
+    mag = FP4_MAG2.index(abs(int(c8)) >> 3)
+    return mag | (8 if c8 < 0 else 0)
+
+
+def pack_fp4(row8: Sequence[int]) -> List[int]:
+    """Pack one MXFP4 row (given as 16 x) into 8 bytes, as pack4."""
+    n = [fp4_nibble(x) for x in row8]
+    return [n[2 * b] | (n[2 * b + 1] << 4) for b in range(len(n) // 2)]
+
+
+def prepare_kvfp4(qf, kf, vf):
+    """Like prepare(), but K and V in MXFP4 (returned as 16 x)."""
+    d = qf.shape[1]
+    q, eq = mx_quantize(qf * (np.log2(np.e) / np.sqrt(d)))
+    k, ek = mx_quantize_fp4(kf)
+    v, ev = mx_quantize_fp4(vf)
+    return q, eq, k, ek, v, ev
 
 
 def prepare_kv4(qf, kf, vf):

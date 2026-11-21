@@ -1,0 +1,6 @@
+fp4 full fused=0 causal=0          cycles= 411 cos FP4=0.98809 (INT4, model=0.97526)
+fp4 full fused=1 causal=0          cycles= 111 cos FP4=0.98809 (INT4, model=0.97529)
+fp4 decode random   tokens=32 cycles@len32= 66 mean cos FP4=0.99022 (model: INT4=0.98572, INT8=0.99983) min FP4=0.96929 INT4=0.96246
+fp4 decode sharp    tokens=32 cycles@len32= 66 mean cos FP4=0.94683 (model: INT4=0.97481, INT8=0.99982) min FP4=0.55417 INT4=0.79190
+fp4 decode outliers tokens=32 cycles@len32= 66 mean cos FP4=0.97827 (model: INT4=0.94083, INT8=0.99972) min FP4=0.86555 INT4=0.01581
+fp4 mixed paging (INT8 pages 0 and 5, FP4 pages 1-4): 24 decode steps bit-exact

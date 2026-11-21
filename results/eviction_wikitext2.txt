@@ -1,0 +1,13 @@
+KV eviction under a cache budget: wikitext2 char LM, context 32, 128 sequences, 2 sinks, recent window budget/2 for h2o; perplexity over positions t >= budget; full = no eviction on the same positions
+budget 16  full    ppl=3.2942
+budget 16  window  ppl=3.3105
+budget 16  h2o     ppl=3.3001
+budget 16  h2o-fp  ppl=3.3008
+budget 12  full    ppl=3.2834
+budget 12  window  ppl=3.3069
+budget 12  h2o     ppl=3.3080
+budget 12  h2o-fp  ppl=3.3026
+budget  8  full    ppl=3.3120
+budget  8  window  ppl=3.3669
+budget  8  h2o     ppl=3.4308
+budget  8  h2o-fp  ppl=3.4322

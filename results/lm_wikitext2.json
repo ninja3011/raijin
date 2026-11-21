@@ -73,19 +73,46 @@
  },
  {
   "variant": "Raijin K INT4, V INT4",
-  "loss": 1.3428221940994263,
-  "ppl": 3.829836810650018,
-  "acc": 0.6033935546875,
-  "zero_p": 0.17456725149443655,
+  "loss": 1.3411281108856201,
+  "ppl": 3.8233542409541013,
+  "acc": 0.599609375,
+  "zero_p": 0.17341914321437027,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin K INT8, V MXFP4",
+  "loss": 1.3174176216125488,
+  "ppl": 3.733766917899906,
+  "acc": 0.60791015625,
+  "zero_p": 0.1671887022076231,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin K MXFP4, V MXFP4",
+  "loss": 1.3386632204055786,
+  "ppl": 3.8139416966947537,
+  "acc": 0.5986328125,
+  "zero_p": 0.1710313739198627,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin K INT4, V MXFP4",
+  "loss": 1.3390326499938965,
+  "ppl": 3.8153509398976726,
+  "acc": 0.601318359375,
+  "zero_p": 0.17434137517755682,
   "acc_overflow": 0,
   "l_overflow": 0
  },
  {
   "variant": "Raijin INT4 + INT8 sink & worst page",
-  "loss": 1.3324640989303589,
-  "ppl": 3.7903717408083715,
-  "acc": 0.6041259765625,
-  "zero_p": 0.1714405868992661,
+  "loss": 1.3339616060256958,
+  "ppl": 3.7960521015128954,
+  "acc": 0.6053466796875,
+  "zero_p": 0.17119205359256628,
   "acc_overflow": 0,
   "l_overflow": 0
  },
@@ -104,6 +131,33 @@
   "ppl": 3.7323789099867395,
   "acc": 0.61181640625,
   "zero_p": 0.2638857292406487,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin MF2, K8 V-MXFP4, SKIPTHR=6",
+  "loss": 1.3176401853561401,
+  "ppl": 3.7345980115250748,
+  "acc": 0.6085205078125,
+  "zero_p": 0.2650532577977036,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin max-first decode, MF2",
+  "loss": 1.3128288984298706,
+  "ppl": 3.7166729448350213,
+  "acc": 0.6129150390625,
+  "zero_p": 0.6879915179628314,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin operating point + max-first decode",
+  "loss": 1.3182820081710815,
+  "ppl": 3.736995731106763,
+  "acc": 0.609130859375,
+  "zero_p": 0.778167031028054,
   "acc_overflow": 0,
   "l_overflow": 0
  }

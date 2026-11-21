@@ -138,8 +138,21 @@ def train(steps=4000):
 # Chip attention
 # ---------------------------------------------------------------------------
 def mxq(x, bits=8):
-    """Row-wise MX quantisation, vectorised; equals rm.mx_quantize / mx_quantize4."""
+    """Row-wise MX quantisation, vectorised; equals rm.mx_quantize / mx_quantize4,
+    and rm.mx_quantize_fp4 for bits="fp4"."""
     amax = np.abs(x).max(axis=-1)
+    if bits == "fp4":
+        with np.errstate(divide="ignore"):
+            ex = np.where(amax == 0, 0, np.ceil(np.log2(np.where(amax == 0, 1, amax) * 4 / 6)))
+        cand = []
+        for exc in (np.clip(ex, -127, 128), np.clip(ex - 1, -127, 128)):
+            y = x / 2.0 ** exc[..., None] * 4
+            g = rm.FP4_GRID[np.abs(y[..., None] - rm.FP4_GRID).argmin(axis=-1)]
+            cand.append((g, exc, ((g / 4 * 2.0 ** exc[..., None] - x) ** 2).sum(-1)))
+        lo = cand[1][2] < cand[0][2]                       # ties keep the larger exponent
+        g = np.where(lo[..., None], cand[1][0], cand[0][0])
+        ex = np.where(lo, cand[1][1], cand[0][1])
+        return np.round(g * 16).astype(np.int64), (ex + rm.EXP_BIAS).astype(np.int64)
     qmax, frac = (127, 64) if bits == 8 else (7, 4)
     with np.errstate(divide="ignore"):
         ex = np.where(amax == 0, 0, np.ceil(np.log2(amax * frac / qmax)))
@@ -161,22 +174,27 @@ def rope_int(m):
     return out
 
 
-def chip_attn(mode=rm.MODE_EXACT, thr=0, kbits=8, vbits=8, int8_pages=None, stats=None):
+def chip_attn(mode=rm.MODE_EXACT, thr=0, kbits=8, vbits=8, int8_pages=None, stats=None, final_max=False):
     def fn(q, k, v):
         qs = q * (math.log2(math.e) / math.sqrt(DH))
         qi, eq = mxq(qs, 8)
-        ki, ek = mxq(k, kbits)
+        # the chip rotates INT8 K rows on write; a 4-bit K is rotated by the host
+        # before it is quantised (RoPE is not applied to 4-bit K on chip)
+        k4rot = kbits != 8
+        ki, ek = mxq(rope(torch.from_numpy(k)).numpy() if k4rot else k, kbits)
         vi, ev = mxq(v, vbits)
         if int8_pages is not None:               # per-page mixed precision
             k8, ek8 = mxq(k, 8)
             v8, ev8 = mxq(v, 8)
+            k8 = rope_int(k8) if k4rot else k8
             sel = int8_pages(k, ki, ek)          # (..., T) bool: token kept in INT8
             ki = np.where(sel[..., None], k8, ki)
             ek = np.where(sel, ek8, ek)
             vi = np.where(sel[..., None], v8, vi)
             ev = np.where(sel, ev8, ev)
-        qi, ki = rope_int(qi), rope_int(ki)
-        o, eo = rv.decode_causal(qi, eq, ki, ek, vi, ev, mode=mode, thr=thr, stats=stats)
+        qi = rope_int(qi)
+        ki = ki if k4rot else rope_int(ki)
+        o, eo = rv.decode_causal(qi, eq, ki, ek, vi, ev, mode=mode, thr=thr, stats=stats, final_max=final_max)
         return o / 64.0 * 2.0 ** (eo[..., None] - rm.EXP_BIAS)
     return fn
 
@@ -210,9 +228,15 @@ def evaluate(n_seq=256):
         ("Raijin MXINT8, key skip SKIPTHR=2", rm.MODE_EXACT, dict(thr=2)),
         ("Raijin K INT8, V INT4", rm.MODE_EXACT, dict(vbits=4)),
         ("Raijin K INT4, V INT4", rm.MODE_EXACT, dict(kbits=4, vbits=4)),
+        ("Raijin K INT8, V MXFP4", rm.MODE_EXACT, dict(vbits="fp4")),
+        ("Raijin K MXFP4, V MXFP4", rm.MODE_EXACT, dict(kbits="fp4", vbits="fp4")),
+        ("Raijin K INT4, V MXFP4", rm.MODE_EXACT, dict(kbits=4, vbits="fp4")),
         ("Raijin INT4 + INT8 sink & worst page", rm.MODE_EXACT, dict(kbits=4, vbits=4, int8_pages=sink_and_worst)),
         ("Raijin K INT8, V INT4, SKIPTHR=6", rm.MODE_EXACT, dict(vbits=4, thr=6)),
         ("Raijin operating point: MF2, K8 V4, SKIPTHR=6", rm.MODE_MF2, dict(vbits=4, thr=6)),
+        ("Raijin MF2, K8 V-MXFP4, SKIPTHR=6", rm.MODE_MF2, dict(vbits="fp4", thr=6)),
+        ("Raijin max-first decode, MF2", rm.MODE_MF2, dict(final_max=True)),
+        ("Raijin operating point + max-first decode", rm.MODE_MF2, dict(vbits=4, thr=6, final_max=True)),
     ]
     res = []
     with torch.no_grad():

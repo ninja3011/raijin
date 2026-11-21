@@ -65,8 +65,19 @@
 //                  8t of its region, element 2b in the low nibble of byte b), so
 //                  with both bits set the cache holds 2N tokens. Each nibble
 //                  enters the INT8 datapath as x4 << 4.
-//   0x5013  SKIPTHR key-skip threshold (0 = off): keys scoring SKIPTHR or more
-//                  powers of two below the running max are dropped (p = 0)
+//                  bit2: 4-bit K nibbles are MXFP4 (E2M1: s e1 e0 m) instead of
+//                  INT4, bit3: the same for V. Both apply to every 4-bit token,
+//                  in KVFMT and mixed (PFMT) modes. An E2M1 nibble enters the
+//                  datapath as +-(2|x|) << 3 = 16 x, 2|x| in {0,1,2,3,4,6,8,12}.
+//   0x5013  SKIPTHR bits3:0 key-skip threshold (0 = off): keys scoring SKIPTHR
+//                  or more powers of two below the running max are dropped (p = 0)
+//                  bit7: max-first decode (feature 17, single-row decode only).
+//                  Pass A streams the K rows and finds the row's final maximum
+//                  while the score of each key is latched; pass B then visits
+//                  only the keys whose weight against that maximum is nonzero,
+//                  reading their V rows. Keys below 2^-9 of the maximum (or
+//                  SKIPTHR below it) cost neither a V read nor a cycle. The
+//                  result equals decode with the maximum known in advance.
 //   0x5014..7 VSKIPS (little endian) V-row reads saved this pass: no lane
 //                  needed the V row, so it was never read
 //   0x5018  ROPE   bit0: rotate Q and K rows on write (RoPE, interleaved pairs,
@@ -166,7 +177,9 @@ module raijin_core #(
     reg signed [7:0]  offset;
     reg [LK:0]        len;
     reg               k4, v4;         // KVFMT: MXINT4 K (bit 0), V (bit 1)
+    reg               kfp, vfp;       // KVFMT: 4-bit K (bit 2), V (bit 3) is MXFP4
     reg  [3:0]        thr;            // SKIPTHR
+    reg               mfirst;         // SKIPTHR bit 7: max-first decode
     reg  [31:0]       vskips;         // V reads saved
     reg               rope_en, rope_abs;  // ROPE
     reg  [7:0]        ropepos;        // ROPEPOS
@@ -202,7 +215,7 @@ module raijin_core #(
     //   write 0x6000 + b:  b 0..15 Q[QROW], 16..31 K[tok], 32..47 V[tok],
     //                      48 e_q[QROW], 49 e_k[tok], 50 e_v[tok],
     //                      51 CTRL: LEN <= LEN + 1, then start with this value
-    //   read  0x6000 + b:  b 0..15 O[QROW], 16 e_o[QROW]
+    //   read  0x6000 + b:  b 0..15 O[QROW], 16 e_o[QROW], 17 HHMIN (eviction slot)
     // tok is the next cache slot, LEN (through PTAB when PAGED is set).
     // INT8 K/V only. Each byte is translated to its ordinary address, so RoPE,
     // paging and the busy rules apply unchanged.
@@ -216,8 +229,9 @@ module raijin_core #(
         baddr = addr_r;
         if (twin) begin
             if (re_r && !we_r)
-                baddr = (tb < 6'd16) ? {4'h3, {(12-LN-LD){1'b0}}, qrow, tb[LD-1:0]}
-                                     : {8'h43, {(8-LN){1'b0}}, qrow};
+                baddr = (tb < 6'd16)  ? {4'h3, {(12-LN-LD){1'b0}}, qrow, tb[LD-1:0]} :
+                        (tb == 6'd17) ? 16'h7081 :
+                                        {8'h43, {(8-LN){1'b0}}, qrow};
             else if (tb < 6'd16) baddr = {4'h0, {(12-LN-LD){1'b0}}, qrow,  tb[LD-1:0]};
             else if (tb < 6'd32) baddr = {4'h1, {(12-LN-LD){1'b0}}, ttrow, tb[LD-1:0]};
             else if (tb < 6'd48) baddr = {4'h2, {(12-LN-LD){1'b0}}, ttrow, tb[LD-1:0]};
@@ -283,7 +297,10 @@ module raijin_core #(
         F_DRAIN    = 5'd17,
         S_DONE     = 5'd18,
         OUT_WAIT   = 5'd19,
-        P_WAIT     = 5'd20;   // pipelined fused: wait for the last O writes
+        P_WAIT     = 5'd20,   // pipelined fused: wait for the last O writes
+        MF_WAIT    = 5'd21,   // max-first decode: pass A drains, m is final
+        MF_MASK    = 5'd22,   //   survivor mask from the latched scores
+        MF_B       = 5'd23;   //   pass B: one surviving key per cycle
 
     reg [4:0]    state;
     reg [LG-1:0] g;
@@ -377,17 +394,34 @@ module raijin_core #(
     wire          k4_d2 = mx_on ? jd2_is4 : k4;
 
     // MXINT4 K/V: pick token t's half of the SRAM word and widen each nibble
-    // to INT8 as x4 << 4 (the host's e_k / e_v account for the 4-bit shift)
+    // to INT8 as x4 << 4 (the host's e_k / e_v account for the 4-bit shift).
+    // MXFP4 (fp = 1): the nibble is E2M1 and widens to +-(2|x|) << 3, the same
+    // 16 x scale, so the rest of the datapath is shared.
+    function [7:0] fp4to8;
+        input [3:0] n;
+        reg   [7:0] mag;
+        begin
+            case (n[2:0])
+                3'd0: mag = 8'd0;   3'd1: mag = 8'd8;
+                3'd2: mag = 8'd16;  3'd3: mag = 8'd24;
+                3'd4: mag = 8'd32;  3'd5: mag = 8'd48;
+                3'd6: mag = 8'd64;  default: mag = 8'd96;
+            endcase
+            fp4to8 = n[3] ? (~mag + 8'd1) : mag;
+        end
+    endfunction
     function [D*8-1:0] unpack4;
         input [NB*32-1:0] w;
         input             hi;
+        input             fp;
         integer c;
         begin
             for (c = 0; c < D; c = c + 1)
-                unpack4[c*8 +: 8] = {w[(hi ? 64 : 0) + c*4 +: 4], 4'd0};
+                unpack4[c*8 +: 8] = fp ? fp4to8(w[(hi ? 64 : 0) + c*4 +: 4])
+                                       : {w[(hi ? 64 : 0) + c*4 +: 4], 4'd0};
         end
     endfunction
-    wire [D*8-1:0] k_row = k4_d2 ? unpack4(d1_r, pj_d2[0]) : d1_r;
+    wire [D*8-1:0] k_row = k4_d2 ? unpack4(d1_r, pj_d2[0], kfp) : d1_r;
 
     integer qi;
     always @(posedge clk) begin
@@ -468,10 +502,17 @@ module raijin_core #(
     // Softmax unit: P lanes
     // ------------------------------------------------------------------
     wire sm_clear   = (state == U_SM_CLR) || (state == F_CLR);
-    wire sm_valid   = fused ? dpu_valid[0] : b_d2;
-    wire sm_mupd    = fused ? 1'b1 : mu_d2;
-    wire sm_emit    = fused ? 1'b1 : em_d2;
-    wire [TW-1:0] sm_tag_in = fused ? dpu_tag[0 +: TW] : tag_d2;
+    // max-first decode: pass A = batch pass 1 (max only) on the DPU scores,
+    // pass B = batch pass 2 (exp and sum against the final m) on latched scores
+    reg               mf_a;                  // pass A of a max-first step
+    reg               mb_v;                  // pass B issue (registered)
+    reg  [LK-1:0]     mb_j;
+    reg signed [11:0] mb_s;
+    wire mfd        = decode && !multi && mfirst;
+    wire sm_valid   = fused ? (dpu_valid[0] || mb_v) : b_d2;
+    wire sm_mupd    = fused ? !mb_v : mu_d2;
+    wire sm_emit    = fused ? !(mfd && mf_a) : em_d2;
+    wire [TW-1:0] sm_tag_in = !fused ? tag_d2 : mb_v ? {g, mb_j} : dpu_tag[0 +: TW];
     wire rcp_go     = (state == RCP_START);
 
     wire [P-1:0]    sm_ovalid;
@@ -487,11 +528,11 @@ module raijin_core #(
     wire [LK-1:0]   sm_j     = sm_tag_in[LK-1:0];
     wire            sm_last  = pipe && (causal ? (sm_j == sm_g * P + P - 1) : (sm_j == N - 1));
     wire [P-1:0]    sm_omask;
+    wire [P*9-1:0]  sm_m;
 
     generate
         for (gr = 0; gr < P; gr = gr + 1) begin : g_sm
-            wire signed [11:0] s_in = fused ? score[gr*12 +: 12] : sb_rd[gr*12 +: 12];
-            wire signed [8:0] m_unused;
+            wire signed [11:0] s_in = !fused ? sb_rd[gr*12 +: 12] : mb_v ? mb_s : score[gr*12 +: 12];
             wire [12:0]       l_unused;
             raijin_softmax_lane #(.TW(TW)) u_lane (
                 .clk(clk), .rst_n(rst_n), .clear(sm_clear), .mode(mode),
@@ -505,11 +546,70 @@ module raijin_core #(
                 .out_p(sm_p[gr*9 +: 9]), .out_sa(sm_sa[gr*4 +: 4]), .out_sb(sm_sb[gr*4 +: 4]),
                 .out_delta(sm_delta[gr*5 +: 5]),
                 .out_first(sm_ofirst[gr]), .out_last(sm_olast[gr]), .out_mask(sm_omask[gr]),
-                .m(m_unused), .l(l_unused),
+                .m(sm_m[gr*9 +: 9]), .l(l_unused),
                 .recip_start(rcp_go), .r_valid(sm_rvalid[gr]), .r(sm_r[gr*13 +: 13])
             );
         end
     endgenerate
+
+    // ---- heavy-hitter tracker (feature 15, region 7) ----
+    // physical slot of the key now entering the lanes (same mapping as pj)
+    wire          sj_is4 = pfmt[sm_j[LK-1:LPG]];
+    wire [LK-1:0] pj_s   = mx_on ? ({ptab[sm_j[LK-1:LPG]], {LPG{1'b0}}} + (sj_is4 ? sm_j[LPG-1:0] : {sm_j[LPG-1:0], 1'b0}))
+                         : pg_on ? {ptab[sm_j[LK-1:LPG]], sm_j[LPG-1:0]} : sm_j;
+    wire          hh_busy, hh_en;
+    wire [LK-1:0] hh_recent;
+    wire [7:0]    hh_rd;
+    raijin_hh #(.NK(NK), .LK(LK)) u_hh (
+        .clk(clk), .rst_n(rst_n),
+        .cap_valid(decode && !multi && dpu_valid[0]), .cap_slot(pj_s),
+        .cap_s(score[qlane*12 +: 12]),
+        .cap_recent({1'b0, sm_j} + hh_recent >= len), .cap_clear(state == F_CLR && decode),
+        .go(state == RCP_START && decode && !multi), .m_fin(sm_m[qlane*9 +: 9]),
+        .busy(hh_busy),
+        .bus_we(we_r && !busy_r && region == 4'h7), .bus_off(boff[7:0]),
+        .bus_wdata(wdata_r), .bus_rdata(hh_rd), .en(hh_en), .recent(hh_recent));
+
+    // ---- max-first decode (feature 17): scores of pass A by logical key ----
+    reg  signed [11:0] mf_sc [0:NK-1];
+    reg  [NK-1:0]      mf_mask;               // keys pass B still has to visit
+    always @(posedge clk) begin
+        if (mfd && mf_a && dpu_valid[0]) mf_sc[dpu_tag[LK-1:0]] <= score[qlane*12 +: 12];
+    end
+    // a key survives if its weight against the final m can be nonzero:
+    // fewer than 9 (or SKIPTHR) powers of two below m (the lanes' own rule)
+    wire signed [8:0] mf_m   = sm_m[qlane*9 +: 9];
+    wire        [3:0] mf_lim = (thr != 4'd0 && thr < 4'd9) ? thr : 4'd9;
+    reg  [NK-1:0]      mf_keep;
+    reg  [LK:0]        mf_drop;               // keys dropped by the mask
+    reg  signed [14:0] mf_t;
+    reg  [LK-1:0]      mf_first;              // lowest set bit of mf_mask
+    integer mi;
+    always @(*) begin
+        mf_drop = 0;
+        for (mi = 0; mi < NK; mi = mi + 1) begin
+            mf_t = ($signed({{2{mf_m[8]}}, mf_m}) <<< 4) - $signed({{3{mf_sc[mi][11]}}, mf_sc[mi]});
+            mf_keep[mi] = (mi < len) && (mf_t[14:4] < {7'd0, mf_lim});
+            if (mi < len && !mf_keep[mi]) mf_drop = mf_drop + 1'b1;
+        end
+        mf_first = {LK{1'b0}};
+        for (mi = NK - 1; mi >= 0; mi = mi - 1)
+            if (mf_mask[mi]) mf_first = mi;
+    end
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            mb_v    <= 1'b0;
+            mf_mask <= {NK{1'b0}};
+        end else begin
+            mb_v <= (state == MF_B) && (|mf_mask);
+            if (state == MF_MASK) mf_mask <= mf_keep;
+            else if (state == MF_B && (|mf_mask)) mf_mask[mf_first] <= 1'b0;
+        end
+    end
+    always @(posedge clk) begin
+        mb_j <= mf_first;
+        mb_s <= mf_sc[mf_first];
+    end
 
     // score buffer writes (unfused): scores from the DPUs, then p codes
     wire            sb_we   = !fused && (dpu_valid[0] || sm_ovalid[0]);
@@ -619,7 +719,7 @@ module raijin_core #(
     wire [P*D*24-1:0] acc;
     raijin_acc_array #(.R(P), .D(D)) u_acc (
         .clk(clk), .rst_n(rst_n), .clear(acc_clear), .mf(mf),
-        .v(av42 ? unpack4(d0_r, aj2[0]) : d0_r), .dv(dvr[aj2]),
+        .v(av42 ? unpack4(d0_r, aj2[0], vfp) : d0_r), .dv(dvr[aj2]),
         .en(aen2), .first(af2), .p(ap2), .sa(asa2), .sb(asb2), .delta(ad2),
         .acc(acc)
     );
@@ -839,8 +939,8 @@ module raijin_core #(
                               5'h0F: rd_reg <= VERSION;
                               5'h10: rd_reg <= len;
                               5'h11: rd_reg <= qrow;
-                              5'h12: rd_reg <= {6'd0, v4, k4};
-                              5'h13: rd_reg <= {4'd0, thr};
+                              5'h12: rd_reg <= {4'd0, vfp, kfp, v4, k4};
+                              5'h13: rd_reg <= {mfirst, 3'd0, thr};
                               5'h14: rd_reg <= vskips[7:0];
                               5'h15: rd_reg <= vskips[15:8];
                               5'h16: rd_reg <= vskips[23:16];
@@ -854,6 +954,7 @@ module raijin_core #(
                                              {(4-(LK-LPG)){1'b0}}, ptab[{cidx[1:0], 1'b0}]};
                               default: rd_reg <= 8'd0;
                           endcase
+                    4'h7: rd_reg <= hh_rd;
                     default: rd_reg <= 8'd0;
                 endcase
             end
@@ -895,7 +996,11 @@ module raijin_core #(
             len    <= N;
             k4     <= 1'b0;
             v4     <= 1'b0;
+            kfp    <= 1'b0;
+            vfp    <= 1'b0;
             thr    <= 4'd0;
+            mfirst <= 1'b0;
+            mf_a   <= 1'b0;
             vskips <= 32'd0;
             rope_en  <= 1'b0;
             rope_abs <= 1'b0;
@@ -921,7 +1026,10 @@ module raijin_core #(
                 if (cidx == 5'h01) offset <= wdata_r;
                 if (cidx == 5'h10 && !twin) len <= wdata_r[LK:0];
                 if (tw_go)                  len <= len + 1'b1;
-                if (cidx == 5'h13) thr <= wdata_r[3:0];
+                if (cidx == 5'h13) begin
+                    thr    <= wdata_r[3:0];
+                    mfirst <= wdata_r[7];
+                end
                 if (cidx == 5'h18) begin
                     rope_en  <= wdata_r[0];
                     rope_abs <= wdata_r[1];
@@ -937,8 +1045,10 @@ module raijin_core #(
                     ptab[{cidx[1:0], 1'b1}] <= wdata_r[4 +: LK-LPG];
                 end
                 if (cidx == 5'h12) begin
-                    k4 <= wdata_r[0];
-                    v4 <= wdata_r[1];
+                    k4  <= wdata_r[0];
+                    v4  <= wdata_r[1];
+                    kfp <= wdata_r[2];
+                    vfp <= wdata_r[3];
                 end
                 if (cidx == 5'h11) qrow   <= wdata_r[LN-1:0];
             end
@@ -946,6 +1056,10 @@ module raijin_core #(
                 cycles <= cycles + 32'd1;
                 skips  <= skips + nskip;
                 if (v_saved) vskips <= vskips + 32'd1;
+                if (state == MF_MASK) begin          // keys pass B never visits
+                    skips  <= skips + nskip + mf_drop;
+                    vskips <= vskips + mf_drop;
+                end
             end
             case (state)
                 S_IDLE: begin
@@ -1071,6 +1185,7 @@ module raijin_core #(
                 // ---------------- fused / decode ----------------
                 F_CLR: begin
                     qcnt  <= 0;
+                    mf_a  <= mfd;
                     state <= Q_LOAD;
                 end
                 F_STREAM: if (!fstall) begin
@@ -1084,9 +1199,24 @@ module raijin_core #(
                         end else if (pipe) begin
                             state <= P_WAIT;
                         end else begin
-                            dcnt  <= 4'd6;
-                            state <= F_DRAIN;
+                            // max-first: the last score reaches the lanes 4 cycles on
+                            dcnt  <= mf_a ? 4'd3 : 4'd6;
+                            state <= mf_a ? MF_WAIT : F_DRAIN;
                         end
+                    end
+                end
+                MF_WAIT: begin
+                    dcnt <= dcnt - 1'b1;
+                    if (dcnt == 0) state <= MF_MASK;
+                end
+                MF_MASK: begin
+                    mf_a  <= 1'b0;
+                    state <= MF_B;
+                end
+                MF_B: begin
+                    if (!(|mf_mask)) begin
+                        dcnt  <= 4'd4;
+                        state <= F_DRAIN;
                     end
                 end
                 P_WAIT: begin
@@ -1096,7 +1226,7 @@ module raijin_core #(
                     dcnt <= dcnt - 1'b1;
                     if (dcnt == 0) state <= RCP_START;
                 end
-                S_DONE: begin
+                S_DONE: if (!hh_busy) begin    // the tracker walk finishes first
                     busy_r <= 1'b0;
                     done_r <= 1'b1;
                     state  <= S_IDLE;

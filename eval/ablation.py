@@ -80,7 +80,7 @@ first, last = rows[0], rows[-1]
 out.append("")
 out.append(f"Prefill {first[1] / last[1]:.1f}x faster, decode {first[2] / last[2]:.1f}x faster, "
            f"KV storage {first[3] / last[3]:.2f}x smaller, V reads {first[4] / last[4]:.1f}x fewer.")
-out.append("Perplexity: FP32 attention is 4.6230. The skip fraction (24.7% of keys) is the one measured in the LM.")
+out.append(f"Perplexity: FP32 attention is {ppl.get('FP32 attention', float('nan')):.4f}. The skip fraction (24.7% of keys) is the one measured in the LM.")
 out.append("")
 out.append("Group pipelining on a full fused (non-causal, encoder-style) pass, one head:")
 out.append(f"{'N':>5s} {'d':>3s} {'unpipelined':>12s} {'pipelined':>10s} {'speed-up':>9s}")

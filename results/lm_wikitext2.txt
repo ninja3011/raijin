@@ -7,7 +7,13 @@ Raijin MXINT8, key skip SKIPTHR=6              ppl=3.7160 (+0.07%) bpc=1.8937 to
 Raijin MXINT8, key skip SKIPTHR=4              ppl=3.7209 (+0.20%) bpc=1.8956 top1=0.6105 zero-weight keys=39.3% l-wraps=0
 Raijin MXINT8, key skip SKIPTHR=2              ppl=3.7708 (+1.55%) bpc=1.9149 top1=0.6064 zero-weight keys=54.6% l-wraps=0
 Raijin K INT8, V INT4                          ppl=3.7296 (+0.44%) bpc=1.8990 top1=0.6112 zero-weight keys=16.6% l-wraps=0
-Raijin K INT4, V INT4                          ppl=3.8298 (+3.14%) bpc=1.9373 top1=0.6034 zero-weight keys=17.5% l-wraps=0
-Raijin INT4 + INT8 sink & worst page           ppl=3.7904 (+2.07%) bpc=1.9223 top1=0.6041 zero-weight keys=17.1% l-wraps=0
+Raijin K INT4, V INT4                          ppl=3.8234 (+2.96%) bpc=1.9348 top1=0.5996 zero-weight keys=17.3% l-wraps=0
+Raijin K INT8, V MXFP4                         ppl=3.7338 (+0.55%) bpc=1.9006 top1=0.6079 zero-weight keys=16.7% l-wraps=0
+Raijin K MXFP4, V MXFP4                        ppl=3.8139 (+2.71%) bpc=1.9313 top1=0.5986 zero-weight keys=17.1% l-wraps=0
+Raijin K INT4, V MXFP4                         ppl=3.8154 (+2.75%) bpc=1.9318 top1=0.6013 zero-weight keys=17.4% l-wraps=0
+Raijin INT4 + INT8 sink & worst page           ppl=3.7961 (+2.23%) bpc=1.9245 top1=0.6053 zero-weight keys=17.1% l-wraps=0
 Raijin K INT8, V INT4, SKIPTHR=6               ppl=3.7308 (+0.47%) bpc=1.8995 top1=0.6115 zero-weight keys=26.4% l-wraps=0
 Raijin operating point: MF2, K8 V4, SKIPTHR=6  ppl=3.7324 (+0.51%) bpc=1.9001 top1=0.6118 zero-weight keys=26.4% l-wraps=0
+Raijin MF2, K8 V-MXFP4, SKIPTHR=6              ppl=3.7346 (+0.57%) bpc=1.9010 top1=0.6085 zero-weight keys=26.5% l-wraps=0
+Raijin max-first decode, MF2                   ppl=3.7167 (+0.09%) bpc=1.8940 top1=0.6129 zero-weight keys=68.8% l-wraps=0
+Raijin operating point + max-first decode      ppl=3.7370 (+0.64%) bpc=1.9019 top1=0.6091 zero-weight keys=77.8% l-wraps=0

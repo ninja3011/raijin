@@ -20,10 +20,11 @@ Q, K, V, O and the score buffer live in four 1 KB sky130 SRAM macros
 
 For LLM inference the core adds:
 - multi-query and speculative decode;
-- an MXINT4, paged KV cache;
+- a paged KV cache in MXINT8, MXINT4 or MXFP4, chosen per tensor or per page;
 - attention sinks;
 - RoPE applied as rows are written;
-- hardware key skip.
+- hardware key skip, and a max-first decode mode that reads V only for keys with nonzero weight;
+- a heavy-hitter (H2O) tracker that names the KV entry to evict.
 
 The tapeout top level, `rtl/raijin_chip.v`, wraps the core with an SPI host
 port and idle clock gating. `docs/performance.md` (and `docs/comparison.md` for prior work) documents each feature,

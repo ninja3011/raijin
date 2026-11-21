@@ -1,0 +1,62 @@
+[
+ {
+  "budget": 16,
+  "policy": "full",
+  "ppl": 3.2941784076457985
+ },
+ {
+  "budget": 16,
+  "policy": "window",
+  "ppl": 3.310493992473147
+ },
+ {
+  "budget": 16,
+  "policy": "h2o",
+  "ppl": 3.3001177949059506
+ },
+ {
+  "budget": 16,
+  "policy": "h2o-fp",
+  "ppl": 3.300810259813936
+ },
+ {
+  "budget": 12,
+  "policy": "full",
+  "ppl": 3.283389494350296
+ },
+ {
+  "budget": 12,
+  "policy": "window",
+  "ppl": 3.3069098255521125
+ },
+ {
+  "budget": 12,
+  "policy": "h2o",
+  "ppl": 3.308028795208738
+ },
+ {
+  "budget": 12,
+  "policy": "h2o-fp",
+  "ppl": 3.302585758127786
+ },
+ {
+  "budget": 8,
+  "policy": "full",
+  "ppl": 3.3120050254002127
+ },
+ {
+  "budget": 8,
+  "policy": "window",
+  "ppl": 3.366907749709166
+ },
+ {
+  "budget": 8,
+  "policy": "h2o",
+  "ppl": 3.4308346958936204
+ },
+ {
+  "budget": 8,
+  "policy": "h2o-fp",
+  "ppl": 3.4321584343192306
+ }
+]

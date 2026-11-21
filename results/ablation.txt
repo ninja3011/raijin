@@ -6,16 +6,16 @@ Cycle counts come from the validated model in eval/scaling.py; accuracy from
 results/lm_perplexity.json. Each row adds one feature to the row above.
 
 configuration                 prefill cyc prefill ms  decode cyc/tok    tok/s KV B/tok/head V reads/tok     ppl
-baseline (sram-kv)              4,341,760      96.48          24,832    1,812           136       6,140  4.6300
-+ group pipelining (2)          4,341,760      96.48          24,832    1,812           136       6,140  4.6300
-+ causal prefill (3)            1,057,000      23.49          24,832    1,812           136       6,140  4.6300
-+ GQA decode (4)                1,057,000      23.49           6,214    7,242           136       1,535  4.6300
-+ INT4 V cache (6)              1,057,000      23.49           6,214    7,242           104       1,535  4.6533
-+ key skip, SKIPTHR=6 (8)       1,057,000      23.49           6,214    7,242           104       1,156  4.6564
-+ MF2 exponent (operating pt)    1,057,000      23.49           6,214    7,242           104       1,156  4.6625
+baseline (sram-kv)              4,341,760      96.48          24,832    1,812           136       6,140  4.8588
++ group pipelining (2)          4,341,760      96.48          24,832    1,812           136       6,140  4.8588
++ causal prefill (3)            1,057,000      23.49          24,832    1,812           136       6,140  4.8588
++ GQA decode (4)                1,057,000      23.49           6,214    7,242           136       1,535  4.8588
++ INT4 V cache (6)              1,057,000      23.49           6,214    7,242           104       1,535  4.8907
++ key skip, SKIPTHR=6 (8)       1,057,000      23.49           6,214    7,242           104       1,156  4.8915
++ MF2 exponent (operating pt)    1,057,000      23.49           6,214    7,242           104       1,156  4.8863
 
 Prefill 4.1x faster, decode 4.0x faster, KV storage 1.31x smaller, V reads 5.3x fewer.
-Perplexity: FP32 attention is 4.6230. The skip fraction (24.7% of keys) is the one measured in the LM.
+Perplexity: FP32 attention is 4.8515. The skip fraction (24.7% of keys) is the one measured in the LM.
 
 Group pipelining on a full fused (non-causal, encoder-style) pass, one head:
     N   d  unpipelined  pipelined  speed-up
