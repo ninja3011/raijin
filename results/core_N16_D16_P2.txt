@@ -1,0 +1,18 @@
+random fused=0 mode=0              cycles= 779 skips=  0 cos=0.99979
+random fused=0 mode=1              cycles= 779 skips=  0 cos=0.98123
+random fused=0 mode=2              cycles= 779 skips=  0 cos=0.99756
+random fused=1 mode=0              cycles= 357 skips=  0 cos=0.99983
+random fused=1 mode=1              cycles= 357 skips=  0 cos=0.98123
+random fused=1 mode=2              cycles= 357 skips=  0 cos=0.99756
+sharp fused=0 mode=0               cycles= 779 skips=182 cos=0.99975
+sharp fused=0 mode=1               cycles= 779 skips=179 cos=0.99516
+sharp fused=0 mode=2               cycles= 779 skips=181 cos=0.99959
+sharp fused=1 mode=0               cycles= 357 skips=138 cos=0.99976
+sharp fused=1 mode=1               cycles= 357 skips=134 cos=0.99518
+sharp fused=1 mode=2               cycles= 357 skips=137 cos=0.99959
+outliers fused=0 mode=0            cycles= 779 skips=118 cos=0.99987
+outliers fused=0 mode=1            cycles= 779 skips=112 cos=0.99965
+outliers fused=0 mode=2            cycles= 779 skips=116 cos=0.99977
+outliers fused=1 mode=0            cycles= 357 skips= 65 cos=0.99989
+outliers fused=1 mode=1            cycles= 357 skips= 61 cos=0.99965
+outliers fused=1 mode=2            cycles= 357 skips= 63 cos=0.99977
