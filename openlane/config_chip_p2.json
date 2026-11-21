@@ -109,5 +109,7 @@
     },
     "RSZ_DONT_USE_CELLS": [
         "sky130_fd_sc_hd__clkdlybuf4s*"
-    ]
+    ],
+    "PNR_SDC_FILE": "dir::raijin_chip.sdc",
+    "SIGNOFF_SDC_FILE": "dir::raijin_chip.sdc"
 }
