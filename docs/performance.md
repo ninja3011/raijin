@@ -743,3 +743,59 @@ cosine against FP32 causal attention, `results/mixed_kv_N16_D16.txt`):
   which checks that keys beyond LEN and pages of other formats are never read
   into the result.
 
+
+## Evaluation inside a real transformer
+
+`eval/lm.py` trains a small character-level language model on Tiny Shakespeare (4 layers, d_model 128, 8 heads of d = 16, RoPE, context 32, 810k parameters, 4000 steps, validation loss about 1.31) and then swaps every attention head for a bit-exact model of the chip (`model/raijin_vec.py`, checked against `model/raijin_model.py`). Q is quantised to MXINT8 per 16-element row with the 1/sqrt(d) log2(e) scale folded in, as the host driver does; K and V go through the same quantiser the chip's KV cache uses. Perplexity is measured on 256 validation sequences (8,192 predicted characters). Raw output: `results/lm_perplexity.txt` and `.json`. Reproduce with `python3 eval/lm.py train` then `python3 eval/lm.py eval`.
+
+| Variant | Perplexity | Change | Top-1 | Keys with zero weight |
+|---|---|---|---|---|
+| FP32 attention | 4.6230 | baseline | 54.58% | 0.0% |
+| MXINT8, exact exp2 | 4.6300 | +0.15% | 54.60% | 15.1% |
+| MXINT8, MF1 (one shift) | 4.6417 | +0.40% | 54.36% | 13.8% |
+| MXINT8, MF2 (two shifts, default) | 4.6321 | +0.19% | 54.55% | 14.4% |
+| Key skip, SKIPTHR = 6 | 4.6310 | +0.17% | 54.47% | 24.7% |
+| Key skip, SKIPTHR = 4 | 4.6384 | +0.33% | 54.22% | 37.8% |
+| Key skip, SKIPTHR = 2 | 4.7445 | +2.63% | 53.86% | 54.1% |
+| K INT8, V INT4 | 4.6533 | +0.65% | 54.33% | 15.0% |
+| K INT4, V INT4 | 4.8043 | +3.92% | 53.43% | 15.8% |
+| INT4 with INT8 sink and worst page (feature 14) | 4.7324 | +2.36% | 53.59% | 15.5% |
+
+What this shows:
+- The chip's arithmetic (MXINT8 operands, base-2 online softmax with the two-shift exponent and the chip's reciprocal) costs 0.19% perplexity in a real model. That is within the noise of retraining.
+- Key skip at SKIPTHR = 6 is free (+0.17%, within 0.02% of no skip) and zeroes a quarter of the keys, so their V reads are gated off. SKIPTHR = 4 still costs only 0.33% and skips 38%. SKIPTHR = 2 is too aggressive.
+- V is much more tolerant of INT4 than K: K8/V4 costs 0.65%, K4/V4 costs 3.9%. Keeping the sink page and the worst page in INT8 (feature 14) recovers 40% of the INT4 loss for the cost of two INT8 pages, so per-page precision is worth its hardware.
+- Recommended operating point for edge decode: MF2, SKIPTHR = 6, K INT8 / V INT4. Expected cost under 1% perplexity with half the V storage and a quarter fewer V reads.
+
+## Analytical scaling model
+
+`eval/scaling.py` is a cycle model of the controller written from the RTL's schedule (load, score, online-softmax, accumulate, drain, reciprocal, output). It is checked against every cycle count the testbench measured; output in `results/scaling.txt`.
+
+Validation: all fused, unfused, decode and multi-query points match the RTL exactly. Causal prefill at P = 4 is predicted at 99 cycles against 97 measured (+2.1%), because the model does not capture one overlap in the RTL's masked-group schedule; the model is conservative there.
+
+Extrapolation at 45 MHz, one head:
+
+| N | d | P | Fused cycles | Utilisation | GOPS | Decode cycles (LEN = N) | Tokens/s |
+|---|---|---|---|---|---|---|---|
+| 16 | 16 | 4 | 111 | 58% | 6.64 | 50 | 900,000 |
+| 64 | 64 | 4 | 4,143 | 99% | 11.39 | 290 | 155,172 |
+| 128 | 64 | 4 | 16,431 | 100% | 11.49 | 546 | 82,418 |
+| 512 | 64 | 4 | 262,191 | 100% | 11.52 | 2,082 | 21,614 |
+| 512 | 64 | 8 | 131,123 | 100% | 23.03 | 2,082 | 21,614 |
+| 2048 | 128 | 4 | 8,388,655 | 100% | 11.52 | 16,418 | 2,741 |
+
+Peak is 64·P operations per cycle (11.5 GOPS at P = 4, 45 MHz). The fused pass reaches full utilisation once N is past about 64, because its fixed cost of 43 + P cycles is paid once per pass. Decode is bound by KV bandwidth (one K row and one V row per cycle), so it takes LEN·d/16 + 34 cycles whatever P is, and multi-query decode serves P query heads in that same time. Multi-head attention with H heads is H passes back to back, so prefill and decode time scale linearly with H. The model assumes the KV cache fits on chip; larger N needs the paged cache (feature 10) to stream pages from off-chip memory.
+
+## Power: why the vectorless figures are not trustworthy
+
+OpenROAD's power report at tt (vectorless, nominal SPEF), in mW:
+
+| Group | sram_p2_dupreg | sram_p2_speed |
+|---|---|---|
+| Sequential | 10.8 | 16.5 |
+| Combinational | 1.0 | 45.0 |
+| Clock | 12.7 | 15.8 |
+| Macros (4 SRAMs) | 7.7 | 7.7 |
+| Total | 32.3 | 84.9 |
+
+The 3.4x jump is an artefact of vectorless activity, not a real cost. The SRAM data outputs are black boxes with activity 0, so in dupreg the whole datapath behind them looks idle (about 0.005 toggles per cycle), which understates power. In the speed run the datapath is driven from propagated flop sources instead (about 0.76 toggles per cycle, more than real MXINT8 data would toggle), which overstates it. Setting activity on the black-box pins had no effect. Neither number should be quoted. The fix in progress is to annotate activity from a gate-level simulation of a fused pass (VCD or SAIF read with `read_vcd`/`read_saif`) and report power again for both runs. Scripts: `openlane/pw.tcl`, `openlane/pw5.tcl`.

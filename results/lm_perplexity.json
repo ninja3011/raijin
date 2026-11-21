@@ -1,0 +1,82 @@
+[
+ {
+  "variant": "FP32 attention",
+  "loss": 1.5310531854629517,
+  "ppl": 4.6230431811337445,
+  "acc": 0.5457763671875,
+  "zero_p": 0.0,
+  "acc_overflow": 0
+ },
+ {
+  "variant": "Raijin MXINT8, exact exp",
+  "loss": 1.5325504541397095,
+  "ppl": 4.62997030346769,
+  "acc": 0.5460205078125,
+  "zero_p": 0.15090919263435132,
+  "acc_overflow": 0
+ },
+ {
+  "variant": "Raijin MXINT8, MF1 (one shift)",
+  "loss": 1.5350894927978516,
+  "ppl": 4.641740913748028,
+  "acc": 0.5435791015625,
+  "zero_p": 0.13764583703243372,
+  "acc_overflow": 0
+ },
+ {
+  "variant": "Raijin MXINT8, MF2 (two shifts)",
+  "loss": 1.5330009460449219,
+  "ppl": 4.632056537491264,
+  "acc": 0.5455322265625,
+  "zero_p": 0.1441255049272017,
+  "acc_overflow": 0
+ },
+ {
+  "variant": "Raijin MXINT8, key skip SKIPTHR=6",
+  "loss": 1.532764196395874,
+  "ppl": 4.630960029535702,
+  "acc": 0.544677734375,
+  "zero_p": 0.2465854991566051,
+  "acc_overflow": 0
+ },
+ {
+  "variant": "Raijin MXINT8, key skip SKIPTHR=4",
+  "loss": 1.5343754291534424,
+  "ppl": 4.63842759841455,
+  "acc": 0.542236328125,
+  "zero_p": 0.3778889973958333,
+  "acc_overflow": 0
+ },
+ {
+  "variant": "Raijin MXINT8, key skip SKIPTHR=2",
+  "loss": 1.556990385055542,
+  "ppl": 4.744520556178462,
+  "acc": 0.53857421875,
+  "zero_p": 0.540799921209162,
+  "acc_overflow": 0
+ },
+ {
+  "variant": "Raijin K INT8, V INT4",
+  "loss": 1.5375710725784302,
+  "ppl": 4.653274068449368,
+  "acc": 0.5433349609375,
+  "zero_p": 0.1502972227154356,
+  "acc_overflow": 0
+ },
+ {
+  "variant": "Raijin K INT4, V INT4",
+  "loss": 1.5695058107376099,
+  "ppl": 4.804273386700138,
+  "acc": 0.5343017578125,
+  "zero_p": 0.15810047496448865,
+  "acc_overflow": 0
+ },
+ {
+  "variant": "Raijin INT4 + INT8 sink & worst page",
+  "loss": 1.554422378540039,
+  "ppl": 4.732352227338294,
+  "acc": 0.535888671875,
+  "zero_p": 0.1549287275834517,
+  "acc_overflow": 0
+ }
+]
