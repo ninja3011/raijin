@@ -35,22 +35,32 @@ module raijin_chip #(
     wire [7:0]  wdata, rdata;
     wire        we, re, active;
 
+    // ---- reset synchroniser: rst_n asserts asynchronously and is released
+    // two clk edges later, in step with clk, so every flop leaves reset in the
+    // same cycle and the pin needs no timing (raijin_chip.sdc false-paths it) ----
+    reg [1:0] rst_s;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) rst_s <= 2'b00;
+        else        rst_s <= {rst_s[0], 1'b1};
+    end
+    wire srst_n = rst_s[1];
+
     raijin_spi u_spi (
-        .clk(clk), .rst_n(rst_n), .sck(sck), .cs_n(cs_n),
+        .clk(clk), .rst_n(srst_n), .sck(sck), .cs_n(cs_n),
         .io_in(io_in), .io_out(io_out), .io_oe(io_oe), .active(active),
         .addr(addr), .wdata(wdata), .we(we), .re(re), .rdata(rdata));
 
     // ---- clock gate enable ----
     reg [4:0] hold;
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)                 hold <= HOLD;
+    always @(posedge clk or negedge srst_n) begin
+        if (!srst_n)                hold <= HOLD;
         else if (we || re || busy)  hold <= HOLD;
         else if (hold != 5'd0)      hold <= hold - 5'd1;
     end
     wire cg_en = (GATE_EN == 0) || we || re || busy || (hold != 5'd0);
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)      gated_cycles <= 32'd0;
+    always @(posedge clk or negedge srst_n) begin
+        if (!srst_n)     gated_cycles <= 32'd0;
         else if (!cg_en) gated_cycles <= gated_cycles + 32'd1;
     end
 
@@ -65,7 +75,7 @@ module raijin_chip #(
 `endif
 
     raijin_core #(.N(N), .D(D), .P(P)) u_core (
-        .clk(gclk), .rst_n(rst_n), .addr(addr), .wdata(wdata), .we(we), .re(re),
+        .clk(gclk), .rst_n(srst_n), .addr(addr), .wdata(wdata), .we(we), .re(re),
         .rdata(rdata), .busy(busy), .done(done));
 endmodule
 `default_nettype wire
