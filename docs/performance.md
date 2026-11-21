@@ -66,6 +66,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 | 11 | Chip top: SPI host port and idle clock gating (`rtl/raijin_spi.v`, `rtl/raijin_chip.v`) | RTL merged; layout config added, not yet run | The whole register and memory map is reachable through 4 SPI pins. Passes over SPI are bit-exact. During a decode loop with 200-cycle idle gaps between tokens, the core clock is off **90.8%** of the time. SPI bandwidth (0.78 MB/s), not compute, now limits the end-to-end token rate |
 | 12 | QSPI host port (0x32 quad write, 0x6B quad read, io[3:0]) | RTL merged | A full Q/K/V load drops from 1,069 µs to **286 µs** (3.7×). Bus time per decode token drops from 135 µs to **66.9 µs**, so the host-limited rate goes from 7,400 to about **15,000 tokens/s**. Plain SPI hosts still work |
 | 13 | Token window (region 0x6000): one write burst and one read burst per decode token | RTL merged | Bus time per decode token over QSPI 66.9 → **36.2 µs**, about **27,700 tokens/s** host-limited: 3.7× the single-lane SPI baseline of feature 11. Works with paging and RoPE |
+| 14 | Per-page mixed KV precision (PAGED bit 1, PFMT 0x501B) | RTL merged | 24 tokens in the 16-word cache: 2 INT8 pages + 4 INT4 pages. On sharp attention, mean decode cosine 0.9656 (all INT4) → **0.9914** with INT8 for the sink page and the worst-error page. No cycle cost |
 
 ### 1. Timing closure
 
@@ -670,4 +671,53 @@ remaining overhead. They are 10 of the 80 bytes, but take over a third of the
 QSPI time, because they run at one bit per clock. Making
 QROW auto-increment as well, or a fully quad command phase (QPI), would remove
 most of the rest.
+
+### 14. Per-page mixed KV precision
+
+Feature 6 showed the trade-off of a uniform format. All-INT4 doubles the
+context, but costs 0.02 to 0.04 cosine, mostly through a few tokens whose
+keys quantize badly. LLM KV-cache work (KIVI, KVQuant, and the attention-sink
+observation behind StreamingLLM) points the same way: precision matters for a
+small set of tokens, namely the sinks, the outliers and often the most
+recent ones. With paging (feature 10), the precision can follow the page.
+
+**Hardware.** With PAGED bit 1 (mixed) set, the cache is addressed in INT4
+*slots*, two per SRAM word, and PFMT (0x501B) marks each logical page as
+INT4 (1) or INT8 (0):
+
+- An INT4 page puts token i at slot 4·PTAB + i.
+- An INT8 page puts token i at slot 4·PTAB + 2i. It fills two slot pages, so
+  its PTAB entry must be even.
+- In both formats the K and V word is slot >> 1, the nibble half is slot & 1,
+  and e_k and e_v sit at index slot. The host writes a token's bytes at byte
+  offset 8·slot of its region, either 8 packed bytes or 16 INT8 bytes.
+
+Per token, the core picks its format from PFMT[j >> 2] in three places: the K
+address and nibble mux, the V address, and the V nibble mux (one more
+2-stage pipeline bit, `av41`/`av42`). The e_vmax valid mask follows the same
+slot rule. All other logic is untouched, so there is no cycle cost. KVFMT is
+ignored in mixed mode; a page's K and V share its format.
+
+**Policy is the host's choice.** The test compares three placements, each
+using the 16-word budget for 24 tokens: 2 INT8 pages (8 words) and 4 INT4
+pages (8 words).
+
+**Measured** (P = 4, 24-token decode, every step bit-exact, mean and minimum
+cosine against FP32 causal attention, `results/mixed_kv_N16_D16.txt`):
+
+| Family | All INT8 (model only; needs 24 words) | All INT4 (12 words) | INT8 sink + most recent page | INT8 sink + worst-K-error page |
+| --- | --- | --- | --- | --- |
+| random | 0.99982 | 0.98496 | 0.99176 | **0.99302** |
+| sharp | 0.99978 | 0.96555 | 0.98747 | **0.99136** |
+| outliers | 0.99967 | 0.97968 | 0.98457 | 0.98457 |
+
+- The outlier-aware placement recovers about 75% of the INT4 loss on sharp
+  attention while holding 1.5× the tokens of an INT8 cache. On the
+  outliers family both policies pick the same pages, hence identical numbers.
+- The minimum cosine is still well below the mean (0.86 on sharp). Some
+  single tokens attend mostly to a key in an INT4 page. Finer pages (2 tokens)
+  or INT8 for more pages would trade capacity for that tail.
+- The test fills the cache with stale bytes from an earlier sequence first,
+  which checks that keys beyond LEN and pages of other formats are never read
+  into the result.
 

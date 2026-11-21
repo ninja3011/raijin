@@ -722,3 +722,97 @@ async def test_token_window(dut):
         await write_ptab(bus, list(range(2 * N // 4)))
     with open(os.path.join(os.path.dirname(__file__), "..", "results", f"token_window_N{N}_D{D}.txt"), "w") as f:
         f.write(chr(10).join(summary) + chr(10))
+
+
+@cocotb.test()
+async def test_mixed_precision_kv(dut):
+    """Per-page KV precision (PAGED bit 1, PFMT 0x501B): each 4-token page is
+    MXINT8 or MXINT4. In the 16-word cache, 2 INT8 pages + 4 INT4 pages hold
+    24 tokens. Policies: all INT4, INT8 for the sink page and the most recent
+    page, and INT8 for the sink page and the page with the largest INT4 K error.
+    Every decode step is bit-exact; accuracy is compared with an all-INT8
+    cache (model only, it cannot hold 24 tokens)."""
+    bus = await setup(dut)
+    rng = np.random.default_rng(int(os.environ.get("RAIJIN_SEED", 7)) + 83)
+    T, NP = 24, 6
+    # stale cache contents from an earlier sequence (never read for LEN keys)
+    for base in (0x1000, 0x2000):
+        for a in range(N * D):
+            await bus.write(base + a, int(rng.integers(0, 256)))
+    summary = []
+    for name, kw in CASES:
+        qf, kf, vf = rm.random_case(rng, n=T, d=D, **kw)
+        q, eq, k8, ek8, v8, ev8 = rm.prepare(qf, kf, vf)
+        _, _, k4, ek4, v4, ev4 = rm.prepare_kv4(qf, kf, vf)
+        ref = rm.reference_causal(qf, kf, vf)
+        kerr = [float(np.abs(rm.mx_dequantize(k4[p*4:p*4+4], ek4[p*4:p*4+4]) - kf[p*4:p*4+4]).max())
+                for p in range(NP)]
+        worst = max(range(1, NP), key=lambda p: kerr[p])
+        policies = {
+            "all INT4": set(),
+            "INT8 sink + recent": {0, NP - 1},
+            "INT8 sink + outlier": {0, worst},
+        }
+        # model-only all-INT8 reference
+        c8 = []
+        for t in range(T):
+            e = rm.attention_decode(q, eq, k8, ek8, v8, ev8, qrow=t, length=t + 1)
+            g = rm.mx_dequantize(e.o, e.eo)[0]
+            c8.append(float(np.dot(g, ref[t]) / np.linalg.norm(g) / np.linalg.norm(ref[t])))
+        summary.append(f"{name:8s} all INT8 (model, 1.5x the SRAM)     mean cos={np.mean(c8):.5f}")
+        for pol, int8 in policies.items():
+            # slot pages: INT8 pages take an even pair first, INT4 pages one each
+            ptab, nxt = [0] * (2 * N // 4), 0
+            for p in sorted(int8):
+                ptab[p], nxt = nxt, nxt + 2
+            for p in range(NP):
+                if p not in int8:
+                    ptab[p], nxt = nxt, nxt + 1
+            assert nxt <= 2 * N // 4
+            pfmt = sum(1 << p for p in range(NP) if p not in int8)
+            await write_ptab(bus, ptab)
+            await bus.write(0x501B, pfmt)
+            await bus.write(0x501A, 3)
+            r1a = await bus.read(0x501A)
+            r1b = await bus.read(0x501B)
+            assert r1a == 3 and r1b == pfmt, (r1a, r1b)
+            km = np.array([k8[t] if t // 4 in int8 else k4[t] for t in range(T)])
+            ekm = np.array([ek8[t] if t // 4 in int8 else ek4[t] for t in range(T)])
+            vm = np.array([v8[t] if t // 4 in int8 else v4[t] for t in range(T)])
+            evm = np.array([ev8[t] if t // 4 in int8 else ev4[t] for t in range(T)])
+            coss = []
+            for t in range(T):
+                p, i = t // 4, t % 4
+                slot = ptab[p] * 4 + (i if p not in int8 else 2 * i)
+                for base, mat in ((0x1000, km), (0x2000, vm)):
+                    data = rm.pack4(mat[t]) if p not in int8 else [int(x) for x in mat[t]]
+                    for b, byte in enumerate(data):
+                        await bus.write(base + 8 * slot + b, int(byte) & 0xFF)
+                await bus.write(0x4100 + slot, int(ekm[t]))
+                await bus.write(0x4200 + slot, int(evm[t]))
+                qr = t % N
+                for c in range(D):
+                    await bus.write(qr * D + c, int(q[t][c]))
+                await bus.write(0x4000 + qr, int(eq[t]))
+                await bus.write(0x5010, t + 1)
+                await bus.write(0x5011, qr)
+                await bus.write(0x5000, 1 | (1 << 4))
+                await wait_done(dut)
+                o, eo, cycles, _ = await read_out(bus, rows=[qr])
+                qa = q[:t + 1].copy()
+                eqa = eq[:t + 1].copy()
+                exp = rm.attention_decode(qa, eqa, km[:t + 1], ekm[:t + 1], vm[:t + 1], evm[:t + 1],
+                                          qrow=t, length=t + 1)
+                assert np.array_equal(o[qr], exp.o[0]) and eo[qr] == exp.eo[0], \
+                    f"{name} {pol} t={t}: rtl={o[qr]} e={eo[qr]} model={exp.o[0]} e={exp.eo[0]}"
+                g = rm.mx_dequantize(o[qr:qr + 1], eo[qr:qr + 1])[0]
+                coss.append(float(np.dot(g, ref[t]) / np.linalg.norm(g) / np.linalg.norm(ref[t])))
+            words = 4 * len(int8) + 2 * (NP - len(int8))
+            summary.append(f"{name:8s} {pol:22s} {words:2d} words  mean cos={np.mean(coss):.5f} "
+                           f"min cos={np.min(coss):.5f}")
+            dut._log.info(summary[-1])
+    await bus.write(0x501A, 0)
+    await bus.write(0x501B, 0)
+    await write_ptab(bus, list(range(2 * N // 4)))
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", f"mixed_kv_N{N}_D{D}.txt"), "w") as f:
+        f.write(chr(10).join(summary) + chr(10))

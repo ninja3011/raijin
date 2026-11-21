@@ -75,7 +75,9 @@
 //                  byte. Rows keep their exponent. Not applied to an MXINT4 K
 //                  region.
 //   0x5019  ROPEPOS position used when ROPE bit1 is set
-//   0x501A  PAGED  bit0: decode reads the KV cache through the page table
+//   0x501A  PAGED  bit0: decode reads the KV cache through the page table;
+//                  bit1: mixed precision, each page INT8 or INT4 per PFMT
+//   0x501B  PFMT   bit p: logical page p is MXINT4 (mixed mode; KVFMT ignored)
 //   0x501C..F PTAB page table, 2N/4 entries of 4 tokens each, entry 2b in the
 //                  low nibble of byte b: logical page -> physical page. Logical
 //                  token j lives in physical token PTAB[j/4]*4 + j%4 (its K/V
@@ -170,16 +172,19 @@ module raijin_core #(
     reg  [7:0]        ropepos;        // ROPEPOS
     localparam        LPG = 2;                    // 4 tokens per page
     localparam        NPG = NK >> LPG;            // pages in the cache
-    reg               paged;                      // PAGED
+    reg               paged;                      // PAGED bit 0
+    reg               mixed;                      // PAGED bit 1: per-page precision
+    reg  [NPG-1:0]    pfmt;                       // PFMT: page is MXINT4
     reg  [LK-LPG-1:0] ptab [0:NPG-1];             // PTAB
     wire              pg_on = paged && decode;
-    // logical token -> physical token (identity unless paged decode)
-    function [LK-1:0] pmap;
-        input [LK-1:0] lj;
-        begin
-            pmap = pg_on ? {ptab[lj[LK-1:LPG]], lj[LPG-1:0]} : lj;
-        end
-    endfunction
+    wire              mx_on = pg_on && mixed;
+    // Mixed precision (feature 14): the cache is addressed in INT4 slots, two
+    // per SRAM word. An INT4 page puts token i at slot 4*PTAB + i, an INT8 page
+    // at slot 4*PTAB + 2i (it fills two slot pages; PTAB must be even). The
+    // word is slot >> 1, the nibble half slot & 1, and e_k / e_v sit at the slot.
+    // NOTE: all lookups below are written as plain expressions (not functions
+    // reading module state), so event-driven simulation re-evaluates them
+    // whenever PTAB, PFMT, PAGED or KVFMT change.
     reg [LN-1:0]      qrow;
     reg [31:0]        cycles, skips;
     assign busy = busy_r;
@@ -321,13 +326,18 @@ module raijin_core #(
     wire k_rd = (state == U_QK) || ((state == F_STREAM) && !fstall);
     wire q_rd = (state == Q_LOAD);
     wire s_rd = (state == U_SM_P1) || (state == U_SM_P2) || (state == U_PV);
+    // logical -> physical slot of the key being read (feature 10, 14)
+    wire          j_is4 = pfmt[j[LK-1:LPG]];
+    wire [LK-1:0] pj    = mx_on ? ({ptab[j[LK-1:LPG]], {LPG{1'b0}}} + (j_is4 ? j[LPG-1:0] : {j[LPG-1:0], 1'b0}))
+                        : pg_on ? {ptab[j[LK-1:LPG]], j[LPG-1:0]} : j;
+    wire          k4_j  = mx_on ? j_is4 : k4;
     integer pb;
     always @(*) begin
         p1_csb  = {NB{1'b1}};
         p1_addr = 8'd0;
         if (k_rd) begin
             p1_csb  = {NB{1'b0}};
-            p1_addr = AK + (k4 ? (pmap(j) >> 1) : pmap(j));
+            p1_addr = AK + ((k4_j || mx_on) ? (pj >> 1) : pj);
         end else if (q_rd) begin
             p1_csb  = {NB{1'b0}};
             p1_addr = AQ + g * P + qcnt;
@@ -361,7 +371,10 @@ module raijin_core #(
     end
     wire [LG-1:0] g_d2 = tag_d2[LK +: LG];
     wire [LK-1:0] j_d2 = tag_d2[LK-1:0];
-    wire [LK-1:0] pj_d2 = pmap(j_d2);     // physical token of the K row in d1_r
+    wire          jd2_is4 = pfmt[j_d2[LK-1:LPG]];
+    wire [LK-1:0] pj_d2 = mx_on ? ({ptab[j_d2[LK-1:LPG]], {LPG{1'b0}}} + (jd2_is4 ? j_d2[LPG-1:0] : {j_d2[LPG-1:0], 1'b0}))
+                        : pg_on ? {ptab[j_d2[LK-1:LPG]], j_d2[LPG-1:0]} : j_d2;   // K row in d1_r
+    wire          k4_d2 = mx_on ? jd2_is4 : k4;
 
     // MXINT4 K/V: pick token t's half of the SRAM word and widen each nibble
     // to INT8 as x4 << 4 (the host's e_k / e_v account for the 4-bit shift)
@@ -374,7 +387,7 @@ module raijin_core #(
                 unpack4[c*8 +: 8] = {w[(hi ? 64 : 0) + c*4 +: 4], 4'd0};
         end
     endfunction
-    wire [D*8-1:0] k_row = k4 ? unpack4(d1_r, pj_d2[0]) : d1_r;
+    wire [D*8-1:0] k_row = k4_d2 ? unpack4(d1_r, pj_d2[0]) : d1_r;
 
     integer qi;
     always @(posedge clk) begin
@@ -407,7 +420,7 @@ module raijin_core #(
         for (pl = 0; pl < NPG; pl = pl + 1)
             for (pt = 0; pt < (1 << LPG); pt = pt + 1)
                 if (pl * (1 << LPG) + pt < len)
-                    pvalid[ptab[pl] * (1 << LPG) + pt] = 1'b1;
+                    pvalid[ptab[pl] * (1 << LPG) + ((mixed && !pfmt[pl]) ? 2 * pt : pt)] = 1'b1;
         for (ei = 0; ei < NK; ei = ei + 1)
             mt[ei*8 +: 8] = (decode ? (pg_on ? pvalid[ei] : (ei < len)) : (ei < N)) ? evm[ei] : 8'd0;
         for (ew = NK / 2; ew >= 1; ew = ew / 2)
@@ -560,10 +573,16 @@ module raijin_core #(
     end
     // a V row is read only if some lane will use it (key skip saves the read)
     wire v_rd    = acc_valid && (|acc_en);
+    // physical slot and format of the V row being accumulated
+    wire          acc_is4 = pfmt[acc_j[LK-1:LPG]];
+    wire [LK-1:0] pacc    = mx_on ? ({ptab[acc_j[LK-1:LPG]], {LPG{1'b0}}} + (acc_is4 ? acc_j[LPG-1:0] : {acc_j[LPG-1:0], 1'b0}))
+                          : pg_on ? {ptab[acc_j[LK-1:LPG]], acc_j[LPG-1:0]} : acc_j;
+    wire          v4_acc  = mx_on ? acc_is4 : v4;
     wire v_saved = acc_valid && !(|acc_en);
 
     reg            av1, av2;
     reg [LK-1:0]   aj1, aj2;
+    reg            av41, av42;
     reg [P*9-1:0]  ap1, ap2;
     reg [P*4-1:0]  asa1, asa2, asb1, asb2;
     reg [P*5-1:0]  ad1, ad2;
@@ -587,7 +606,8 @@ module raijin_core #(
         ag1 <= sm_otag[LK +: LG];  ag2 <= ag1;  ag3 <= ag2;  ag4 <= ag3;
     end
     always @(posedge clk) begin
-        aj1 <= pmap(acc_j); aj2 <= aj1;   // physical token: V nibble half, dv
+        aj1 <= pacc;       aj2 <= aj1;   // physical token: V nibble half, dv
+        av41 <= v4_acc;    av42 <= av41;
         ap1 <= acc_p;      ap2 <= ap1;
         asa1 <= acc_sa;    asa2 <= asa1;
         asb1 <= acc_sb;    asb2 <= asb1;
@@ -599,7 +619,7 @@ module raijin_core #(
     wire [P*D*24-1:0] acc;
     raijin_acc_array #(.R(P), .D(D)) u_acc (
         .clk(clk), .rst_n(rst_n), .clear(acc_clear), .mf(mf),
-        .v(v4 ? unpack4(d0_r, aj2[0]) : d0_r), .dv(dvr[aj2]),
+        .v(av42 ? unpack4(d0_r, aj2[0]) : d0_r), .dv(dvr[aj2]),
         .en(aen2), .first(af2), .p(ap2), .sa(asa2), .sb(asb2), .delta(ad2),
         .acc(acc)
     );
@@ -739,7 +759,7 @@ module raijin_core #(
             p0_din  = (pipe && !oq_byp) ? oq_row[oq_rp] : o_row;
         end else if (v_rd) begin
             p0_csb  = {NB{1'b0}};
-            p0_addr = AV + (v4 ? (pmap(acc_j) >> 1) : pmap(acc_j));
+            p0_addr = AV + ((v4_acc || mx_on) ? (pacc >> 1) : pacc);
         end else if (sb_we) begin
             for (mb = 0; mb < NSB; mb = mb + 1) begin
                 p0_csb[mb] = 1'b0;
@@ -827,7 +847,8 @@ module raijin_core #(
                               5'h17: rd_reg <= vskips[31:24];
                               5'h18: rd_reg <= {6'd0, rope_abs, rope_en};
                               5'h19: rd_reg <= ropepos;
-                              5'h1A: rd_reg <= {7'd0, paged};
+                              5'h1A: rd_reg <= {6'd0, mixed, paged};
+                              5'h1B: rd_reg <= pfmt;
                               5'h1C, 5'h1D, 5'h1E, 5'h1F:
                                   rd_reg <= {{(4-(LK-LPG)){1'b0}}, ptab[{cidx[1:0], 1'b1}],
                                              {(4-(LK-LPG)){1'b0}}, ptab[{cidx[1:0], 1'b0}]};
@@ -880,6 +901,8 @@ module raijin_core #(
             rope_abs <= 1'b0;
             ropepos  <= 8'd0;
             paged    <= 1'b0;
+            mixed    <= 1'b0;
+            pfmt     <= {NPG{1'b0}};
             for (pi = 0; pi < NPG; pi = pi + 1) ptab[pi] <= pi;
             qrow   <= {LN{1'b0}};
             cycles <= 32'd0;
@@ -904,7 +927,11 @@ module raijin_core #(
                     rope_abs <= wdata_r[1];
                 end
                 if (cidx == 5'h19) ropepos <= wdata_r;
-                if (cidx == 5'h1A) paged <= wdata_r[0];
+                if (cidx == 5'h1A) begin
+                    paged <= wdata_r[0];
+                    mixed <= wdata_r[1];
+                end
+                if (cidx == 5'h1B) pfmt <= wdata_r[NPG-1:0];
                 if (cidx[4:2] == 3'b111) begin
                     ptab[{cidx[1:0], 1'b0}] <= wdata_r[LK-LPG-1:0];
                     ptab[{cidx[1:0], 1'b1}] <= wdata_r[4 +: LK-LPG];
