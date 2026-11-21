@@ -1,0 +1,13 @@
+random   mode=0 thr=0: V reads 136 -> 136 of 136 (0% fewer), cycles at LEN=16 50 -> 70, total cycles 680 -> 880, mean cos 0.99987 -> 0.99986
+random   mode=0 thr=6: V reads 130 -> 127 of 136 (2% fewer), cycles at LEN=16 50 -> 67, total cycles 680 -> 871, mean cos 0.99986 -> 0.99983
+random   mode=2 thr=0: V reads 136 -> 136 of 136 (0% fewer), cycles at LEN=16 50 -> 70, total cycles 680 -> 880, mean cos 0.99902 -> 0.99901
+random   mode=2 thr=6: V reads 130 -> 127 of 136 (2% fewer), cycles at LEN=16 50 -> 67, total cycles 680 -> 871, mean cos 0.99897 -> 0.99896
+sharp    mode=0 thr=0: V reads  69 ->  41 of 136 (41% fewer), cycles at LEN=16 50 -> 63, total cycles 680 -> 793, mean cos 0.99988 -> 0.99988
+sharp    mode=0 thr=6: V reads  59 ->  31 of 136 (47% fewer), cycles at LEN=16 50 -> 58, total cycles 680 -> 775, mean cos 0.99985 -> 0.99981
+sharp    mode=2 thr=0: V reads  70 ->  42 of 136 (40% fewer), cycles at LEN=16 50 -> 63, total cycles 680 -> 793, mean cos 0.99976 -> 0.99975
+sharp    mode=2 thr=6: V reads  59 ->  31 of 136 (47% fewer), cycles at LEN=16 50 -> 58, total cycles 680 -> 775, mean cos 0.99975 -> 0.99969
+outliers mode=0 thr=0: V reads  77 ->  52 of 136 (32% fewer), cycles at LEN=16 50 -> 57, total cycles 680 -> 798, mean cos 0.99983 -> 0.99967
+outliers mode=0 thr=6: V reads  73 ->  46 of 136 (37% fewer), cycles at LEN=16 50 -> 56, total cycles 680 -> 790, mean cos 0.99982 -> 0.99966
+outliers mode=2 thr=0: V reads  78 ->  53 of 136 (32% fewer), cycles at LEN=16 50 -> 57, total cycles 680 -> 798, mean cos 0.99958 -> 0.99958
+outliers mode=2 thr=6: V reads  73 ->  46 of 136 (37% fewer), cycles at LEN=16 50 -> 56, total cycles 680 -> 790, mean cos 0.99958 -> 0.99956
+MXINT4 cache LEN=32: cycles 66 -> 97, V reads 28 -> 24

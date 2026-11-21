@@ -15,3 +15,5 @@ Raijin INT4 + INT8 sink & worst page           ppl=4.9746 (+2.54%) bpc=2.3146 to
 Raijin K INT8, V INT4, SKIPTHR=6               ppl=4.8915 (+0.83%) bpc=2.2903 top1=0.5244 zero-weight keys=24.6% l-wraps=0
 Raijin operating point: MF2, K8 V4, SKIPTHR=6  ppl=4.8863 (+0.72%) bpc=2.2887 top1=0.5248 zero-weight keys=24.6% l-wraps=0
 Raijin MF2, K8 V-MXFP4, SKIPTHR=6              ppl=4.8796 (+0.58%) bpc=2.2868 top1=0.5261 zero-weight keys=24.7% l-wraps=0
+Raijin max-first decode, MF2                   ppl=4.8579 (+0.13%) bpc=2.2803 top1=0.5286 zero-weight keys=63.9% l-wraps=0
+Raijin operating point + max-first decode      ppl=4.8826 (+0.64%) bpc=2.2877 top1=0.5244 zero-weight keys=74.1% l-wraps=0

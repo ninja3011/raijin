@@ -227,8 +227,14 @@ def attention(q, eq, k, ek, v, ev, *, fused: bool, mode: int = MODE_EXACT,
 
 def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
                      mode: int = MODE_EXACT, offset: int = 0,
-                     emax_len: int | None = None, thr: int = 0) -> PassResult:
+                     emax_len: int | None = None, thr: int = 0,
+                     final_max: bool = False) -> PassResult:
     """One KV-cache decode step: query row `qrow` attends to keys 0..length-1.
+
+    final_max (max-first decode, feature 17): the running maximum starts at the
+    row's final maximum, as when a score pass finds it before any weight is
+    formed. No rescale then happens, and every key whose weight underflows
+    against the true maximum is skipped.
 
     This is the fused (online softmax) pass for one query over a key prefix.
     e_vmax is taken over the cached V rows only, as in the RTL. The result
@@ -241,6 +247,8 @@ def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
     s = [requant(dpu(q[qrow], k[j]), int(eq[qrow]) + int(ek[j]), offset) for j in range(length)]
     acc = [0] * d
     lsum, m, skips = 0, M_INIT, 0
+    if final_max:
+        m = max(M_INIT, max(ceil_int(x) for x in s))
     for j in range(length):
         mn = max(m, ceil_int(s[j]))
         delta = mn - m

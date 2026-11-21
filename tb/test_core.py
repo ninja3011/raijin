@@ -591,6 +591,110 @@ async def test_fp4_kv_cache(dut):
 
 
 @cocotb.test()
+async def test_max_first_decode(dut):
+    """Max-first decode (SKIPTHR bit 7): pass A scores every cached key and
+    finds the final maximum, pass B visits only keys with a nonzero weight
+    against it. Bit-exact with the model's final-max decode, SKIPS and VSKIPS
+    count the keys pass B never visits, and the heavy-hitter tracker sees the
+    same scores as in a normal step. Cycles and V reads are compared with the
+    normal (running-max) decode."""
+    bus = await setup(dut)
+    rng = np.random.default_rng(int(os.environ.get("RAIJIN_SEED", 7)) + 101)
+    summary = []
+
+    async def step(row, length, mf, thr):
+        await bus.write(0x5013, thr | (0x80 if mf else 0))
+        await bus.write(0x5010, length)
+        await bus.write(0x5011, row)
+        await bus.write(0x5000, 1 | (1 << 4))
+        await wait_done(dut)
+        o, eo, cycles, skips = await read_out(bus, rows=[row])
+        return o[row], eo[row], cycles, skips, await bus.read32(0x5014)
+
+    await bus.write(0x5013, 0x86)
+    assert await bus.read(0x5013) == 0x86
+    for name, kw in CASES:
+        qf, kf, vf = rm.random_case(rng, n=N, d=D, **kw)
+        args = rm.prepare(qf, kf, vf)
+        await load(bus, *args)
+        ref = rm.reference_causal(qf, kf, vf)
+        for mode in (rm.MODE_EXACT, rm.MODE_MF2):
+            for thr in (0, 6):
+                stats = {False: [0, 0, 0, []], True: [0, 0, 0, []]}   # cycles, V reads, steps, cos
+                for t in range(N):
+                    for mf in (False, True):
+                        await bus.write(0x5013, thr | (0x80 if mf else 0))
+                        await bus.write(0x5010, t + 1)
+                        await bus.write(0x5011, t)
+                        await bus.write(0x5000, 1 | (1 << 4) | (mode << 2))
+                        await wait_done(dut)
+                        o, eo, cycles, skips = await read_out(bus, rows=[t])
+                        vsk = await bus.read32(0x5014)
+                        exp = rm.attention_decode(*args, qrow=t, length=t + 1, mode=mode, thr=thr, final_max=mf)
+                        tag = f"{name} mode={mode} thr={thr} mf={int(mf)} len={t + 1}"
+                        assert np.array_equal(o[t], exp.o[0]) and eo[t] == exp.eo[0], \
+                            f"{tag}: rtl={o[t]} e={eo[t]} model={exp.o[0]} e={exp.eo[0]}"
+                        assert skips == exp.skips and vsk == exp.skips, \
+                            f"{tag}: skips={skips} vsk={vsk} model={exp.skips}"
+                        st = stats[mf]
+                        st[0] += cycles
+                        st[1] += t + 1 - vsk
+                        st[2] += t + 1
+                        st[3].append(_cos(rm.mx_dequantize(o[t:t + 1], eo[t:t + 1])[0], ref[t]))
+                        if t == N - 1:
+                            st.append(cycles)
+                n0, n1 = stats[False], stats[True]
+                summary.append(f"{name:8s} mode={mode} thr={thr}: V reads {n0[1]:3d} -> {n1[1]:3d} of {n0[2]} "
+                               f"({100 * (1 - n1[1] / n0[1]):.0f}% fewer), cycles at LEN={N} {n0[4]} -> {n1[4]}, "
+                               f"total cycles {n0[0]} -> {n1[0]}, mean cos {np.mean(n0[3]):.5f} -> {np.mean(n1[3]):.5f}")
+                dut._log.info(summary[-1])
+    # 2N-token MXINT4 cache, LEN = 2N
+    await bus.write(0x5012, 3)
+    T = 2 * N
+    qf, kf, vf = rm.random_case(rng, n=T, d=D, scale=1.5)
+    q, eq, k, ek, v, ev = rm.prepare_kv4(qf, kf, vf)
+    for base, mat in ((0x1000, k), (0x2000, v)):
+        for t in range(T):
+            for b, byte in enumerate(rm.pack4(mat[t])):
+                await bus.write(base + 8 * t + b, byte)
+    for t in range(T):
+        await bus.write(0x4100 + t, int(ek[t]))
+        await bus.write(0x4200 + t, int(ev[t]))
+    row = 5
+    for c in range(D):
+        await bus.write(row * D + c, int(q[T - 1][c]))
+    await bus.write(0x4000 + row, int(eq[T - 1]))
+    mq = np.zeros((N, D), dtype=np.int64)
+    meq = np.zeros(N, dtype=np.int64)
+    mq[row], meq[row] = q[T - 1], eq[T - 1]
+    res = {}
+    for mf in (False, True):
+        o, eo, cycles, skips, vsk = await step(row, T, mf, 0)
+        exp = rm.attention_decode(mq, meq, k, ek, v, ev, qrow=row, length=T, final_max=mf)
+        assert np.array_equal(o, exp.o[0]) and eo == exp.eo[0], f"INT4 LEN={T} mf={mf} mismatch"
+        assert skips == exp.skips and vsk == exp.skips
+        res[mf] = (cycles, T - vsk)
+    summary.append(f"MXINT4 cache LEN={T}: cycles {res[False][0]} -> {res[True][0]}, "
+                   f"V reads {res[False][1]} -> {res[True][1]}")
+    dut._log.info(summary[-1])
+    await bus.write(0x5012, 0)
+    # the tracker accumulates the same weights in either kind of step
+    qf, kf, vf = rm.random_case(rng, n=N, d=D, scale=2.5)
+    args = rm.prepare(qf, kf, vf)
+    await load(bus, *args)
+    accs = {}
+    for mf in (False, True):
+        await bus.write(0x7080, 0x3)
+        await step(N - 1, N, mf, 0)
+        accs[mf] = [await bus.read(0x7000 + i) for i in range(2 * N)] + [await bus.read(0x7081)]
+    assert accs[False] == accs[True], (accs[False], accs[True])
+    await bus.write(0x7080, 0x2)
+    await bus.write(0x5013, 0)
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", f"max_first_N{N}_D{D}.txt"), "w") as f:
+        f.write(chr(10).join(summary) + chr(10))
+
+
+@cocotb.test()
 async def test_key_skip(dut):
     """Hardware key skip (SKIPTHR, 0x5013): keys scoring SKIPTHR or more powers
     of two below the running max get p = 0. When no row of a P-row group uses a

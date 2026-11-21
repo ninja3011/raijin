@@ -23,7 +23,7 @@ For LLM inference the core adds:
 - a paged KV cache in MXINT8, MXINT4 or MXFP4, chosen per tensor or per page;
 - attention sinks;
 - RoPE applied as rows are written;
-- hardware key skip;
+- hardware key skip, and a max-first decode mode that reads V only for keys with nonzero weight;
 - a heavy-hitter (H2O) tracker that names the KV entry to evict.
 
 The tapeout top level, `rtl/raijin_chip.v`, wraps the core with an SPI host

@@ -69,6 +69,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 | 14 | Per-page mixed KV precision (PAGED bit 1, PFMT 0x501B) | RTL merged | 24 tokens in the 16-word cache: 2 INT8 pages + 4 INT4 pages. On sharp attention, mean decode cosine 0.9656 (all INT4) → **0.9914** with INT8 for the sink page and the worst-error page. No cycle cost |
 | 15 | Heavy-hitter tracker for KV eviction (region 0x7000, `rtl/raijin_hh.v`) | RTL merged | Per-slot accumulators of attention weight and an on-chip argmin (HHMIN) give the host its H2O eviction victim with one byte read, also in the token window. Decode step 50 → **62** cycles at LEN = 16 with the tracker on, unchanged when off. Bit-exact with the model. On the char LMs, chip H2O matches FP H2O within 0.25% and beats a sliding window at budget 16 (4.608 vs 4.633), but loses at budget 8 |
 | 16 | MXFP4 KV elements (KVFMT bits 2, 3: E2M1 nibbles) | RTL merged | Same storage and cycles as MXINT4; a 16-entry nibble decoder in front of the shared INT8 datapath. Bit-exact in full passes, 2N-token decode and mixed paging. Row RMS error 0.128 → **0.109**; with K and V both 4-bit, char-LM cost +3.33% → **+2.61%** (Tiny Shakespeare) and +2.96% → **+2.71%** (WikiText-2). V-only is a wash |
+| 17 | Max-first decode (SKIPTHR bit 7) | RTL merged | Pass A scores all cached keys and finds the true maximum; pass B visits only keys with nonzero weight. In the char LMs the share of keys needing a V read drops from 86% to **36%** (Tiny Shakespeare) and 84% to **31%** (WikiText-2), for +0.06% and +0.05% perplexity. Bit-exact. Decode at LEN = 16 takes 57 to 70 cycles instead of 50 (it is bus-limited anyway) |
 
 ### 1. Timing closure
 
@@ -886,6 +887,79 @@ In the language models (tables in the evaluation section below):
 - MXFP8 (E4M3) elements would need a real floating-point multiplier in the
   DPU and are left as future work.
 
+### 17. Max-first decode
+
+Feature 8 skips the V read of a key whose weight underflows, but only against
+the *running* maximum: a key that arrives before the strongest key looks
+important when it is scored, its V row is read and accumulated, and a later
+rescale shifts its contribution out again. In the character LMs only 14% to
+16% of keys end up skipped this way, although after the whole row is seen
+64% to 69% of them have a weight below 2^−9 of the maximum.
+
+The user's plan item was to skip keys *before* scoring them, from a 4-bit
+sketch of K. Measured on the same models, that does not pay on this chip: the
+sketch pass still reads one key per cycle, so it saves no time, and its error
+bound (8·Σ|q| per score) only rules out about 40% of keys safely, needing a
+separate sketch store besides. Knowing the true maximum first skips more, and
+reuses a datapath the chip already has.
+
+**Hardware.** With SKIPTHR bit 7 set, a single-row decode step runs in two
+passes:
+
+- *Pass A* streams the LEN K rows through the DPUs, as now. The lanes run in
+  batch pass-1 mode (maximum only, no weights), and the query lane's 12-bit
+  score of each key is latched by logical index (32 × 12 flops).
+- *Mask.* When m is final, 32 comparators mark the keys with
+  floor((16m − s)/16) < 9 (or < SKIPTHR): exactly the keys whose weight can be
+  nonzero, in every exp mode.
+- *Pass B* visits only marked keys, one per cycle, lowest index first (a
+  priority encoder), and feeds their latched scores to the lanes in batch
+  pass-2 mode (exp and sum against the fixed m, no rescale). Their V rows are
+  read and accumulated as in a fused step. Unmarked keys cost neither a V read
+  nor a cycle.
+
+SKIPS and VSKIPS count the keys pass B never visits. The heavy-hitter tracker
+(feature 15) captures its scores in pass A, so it behaves identically.
+Multi-query decode keeps the one-pass flow.
+
+**Cost.** A step takes about LEN + survivors + 38 cycles instead of LEN + 34:
+57 to 70 cycles at LEN = 16 against 50, depending on how sharp the attention
+is, and 97 against 66 for a 32-token INT4 cache. Decode is limited by the host
+bus (36 µs per token over QSPI, feature 13, against 1.0 to 1.4 µs of compute
+at 50 MHz), so the extra cycles do not lower the token rate. What it buys is
+fewer 128-bit V reads and accumulator updates, which are half the SRAM traffic
+of a decode step.
+
+**Verification** (`tb/test_core.py::test_max_first_decode`,
+`results/max_first_N16_D16.txt`): every decode length 1..16 for the three
+score families, exact and MF2 modes, SKIPTHR 0 and 6, then a 32-token INT4
+cache, all bit-exact with `raijin_model.attention_decode(final_max=True)`,
+with SKIPS and VSKIPS checked. The tracker's accumulators and HHMIN after a
+max-first step match a normal step's.
+
+| Family | V reads, normal → max-first (16 steps, 136 keys) | Cycles at LEN = 16 |
+| --- | --- | --- |
+| random (flat) | 136 → 136 | 50 → 70 |
+| sharp | 69 → **41** (−41%) | 50 → 63 |
+| outliers | 77 → **52** (−32%) | 50 → 57 |
+
+**In the language models** (`results/lm_perplexity.txt`, `results/lm_wikitext2.txt`):
+
+| Model | Keys needing a V read, normal | Max-first | Perplexity change from max-first |
+| --- | --- | --- | --- |
+| Tiny Shakespeare (MF2) | 85.6% | **36.1%** | 4.8551 → 4.8579 (+0.06%) |
+| WikiText-2 (MF2) | 84.0% | **31.2%** | 3.7147 → 3.7167 (+0.05%) |
+| Tiny Shakespeare, operating point | 75.4% | **25.9%** | 4.8863 → 4.8826 (−0.08%) |
+| WikiText-2, operating point | 73.6% | **22.2%** | 3.7324 → 3.7370 (+0.12%) |
+
+- The result is not an approximation of attention: it is the same online
+  softmax with the maximum known in advance, which is what a two-pass
+  (unfused) softmax computes. The small perplexity changes come from the
+  chip's fixed-point rounding seeing a different (no-rescale) order of
+  operations.
+- On flat attention nothing can be skipped, and the step only gets longer.
+  The host can leave the bit off for layers or heads with flat attention.
+
 ## Evaluation inside a real transformer
 
 `eval/lm.py` trains a small character-level language model on Tiny Shakespeare (4 layers, d_model 128, 8 heads of d = 16, RoPE, context 32, 810k parameters, 4000 steps, validation loss about 1.31) and then swaps every attention head for a bit-exact model of the chip (`model/raijin_vec.py`, checked against `model/raijin_model.py`). Q is quantised to MXINT8 per 16-element row with the 1/sqrt(d) log2(e) scale folded in, as the host driver does; K and V go through the same quantiser the chip's KV cache uses. Perplexity is measured on 256 validation sequences (8,192 predicted characters). Raw output: `results/lm_perplexity.txt` and `.json`. Reproduce with `python3 eval/lm.py train` then `python3 eval/lm.py eval`.
@@ -906,6 +980,8 @@ In the language models (tables in the evaluation section below):
 | INT4 with INT8 sink and worst page (feature 14) | 4.9746 | +2.54% | 52.19% | 15.5% |
 | K INT8, V INT4, SKIPTHR = 6 | 4.8915 | +0.83% | 52.44% | 24.6% |
 | **Operating point: MF2, K INT8, V INT4, SKIPTHR = 6** | **4.8863** | **+0.72%** | 52.48% | 24.6% |
+| Max-first decode, MF2 (feature 17) | 4.8579 | +0.13% | 52.86% | 63.9% |
+| Operating point + max-first decode | 4.8826 | +0.64% | 52.44% | 74.1% |
 
 What this shows:
 - The chip's arithmetic (MXINT8 operands, base-2 online softmax with the two-shift exponent and the chip's reciprocal) costs 0.07% to 0.15% perplexity in a real model. That is within the noise of retraining.
@@ -935,6 +1011,8 @@ The same model, trained from scratch on the WikiText-2 training split (Merity et
 | INT4 with INT8 sink and worst page (feature 14) | 3.7961 | +2.23% | 1.9245 | 17.1% |
 | K INT8, V INT4, SKIPTHR = 6 | 3.7308 | +0.47% | 1.8995 | 26.4% |
 | **Operating point: MF2, K INT8, V INT4, SKIPTHR = 6** | **3.7324** | **+0.51%** | 1.9001 | 26.4% |
+| Max-first decode, MF2 (feature 17) | 3.7167 | +0.09% | 1.8940 | 68.8% |
+| Operating point + max-first decode | 3.7370 | +0.64% | 1.9019 | 77.8% |
 
 The ranking of the variants is the same as on Tiny Shakespeare, except that V-only MXFP4 and V-only INT4 swap places (they are within 0.1% of each other on both), and every cost is a little smaller, so the conclusions above are not an artefact of one dataset.
 

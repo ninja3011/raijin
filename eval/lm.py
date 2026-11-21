@@ -174,7 +174,7 @@ def rope_int(m):
     return out
 
 
-def chip_attn(mode=rm.MODE_EXACT, thr=0, kbits=8, vbits=8, int8_pages=None, stats=None):
+def chip_attn(mode=rm.MODE_EXACT, thr=0, kbits=8, vbits=8, int8_pages=None, stats=None, final_max=False):
     def fn(q, k, v):
         qs = q * (math.log2(math.e) / math.sqrt(DH))
         qi, eq = mxq(qs, 8)
@@ -194,7 +194,7 @@ def chip_attn(mode=rm.MODE_EXACT, thr=0, kbits=8, vbits=8, int8_pages=None, stat
             ev = np.where(sel, ev8, ev)
         qi = rope_int(qi)
         ki = ki if k4rot else rope_int(ki)
-        o, eo = rv.decode_causal(qi, eq, ki, ek, vi, ev, mode=mode, thr=thr, stats=stats)
+        o, eo = rv.decode_causal(qi, eq, ki, ek, vi, ev, mode=mode, thr=thr, stats=stats, final_max=final_max)
         return o / 64.0 * 2.0 ** (eo[..., None] - rm.EXP_BIAS)
     return fn
 
@@ -235,6 +235,8 @@ def evaluate(n_seq=256):
         ("Raijin K INT8, V INT4, SKIPTHR=6", rm.MODE_EXACT, dict(vbits=4, thr=6)),
         ("Raijin operating point: MF2, K8 V4, SKIPTHR=6", rm.MODE_MF2, dict(vbits=4, thr=6)),
         ("Raijin MF2, K8 V-MXFP4, SKIPTHR=6", rm.MODE_MF2, dict(vbits="fp4", thr=6)),
+        ("Raijin max-first decode, MF2", rm.MODE_MF2, dict(final_max=True)),
+        ("Raijin operating point + max-first decode", rm.MODE_MF2, dict(vbits=4, thr=6, final_max=True)),
     ]
     res = []
     with torch.no_grad():

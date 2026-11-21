@@ -142,5 +142,23 @@
   "zero_p": 0.2650532577977036,
   "acc_overflow": 0,
   "l_overflow": 0
+ },
+ {
+  "variant": "Raijin max-first decode, MF2",
+  "loss": 1.3128288984298706,
+  "ppl": 3.7166729448350213,
+  "acc": 0.6129150390625,
+  "zero_p": 0.6879915179628314,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin operating point + max-first decode",
+  "loss": 1.3182820081710815,
+  "ppl": 3.736995731106763,
+  "acc": 0.609130859375,
+  "zero_p": 0.778167031028054,
+  "acc_overflow": 0,
+  "l_overflow": 0
  }
 ]
