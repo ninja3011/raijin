@@ -64,6 +64,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 | 9 | RoPE on write (ROPE 0x5018, ROPEPOS 0x5019, `rtl/raijin_rope.v`) | RTL merged | No cycle or datapath-timing cost: rows are rotated on their way into SRAM. Bit-exact; mean cosine against FP32 RoPE attention is 0.9989 to 0.9999 across fused, unfused, causal and decode passes, including decode at absolute positions 200 to 215 |
 | 10 | Paged KV cache (PAGED 0x501A, PTAB 0x501C..F) | RTL merged | No cycle cost: the page table sits on the K and V read addresses. Two sequences share one cache and one prompt page, and a 32-token INT4 cache is scattered over a shuffled page order. Every decode step is bit-exact with decode on the gathered logical sequence |
 | 11 | Chip top: SPI host port and idle clock gating (`rtl/raijin_spi.v`, `rtl/raijin_chip.v`) | RTL merged; layout config added, not yet run | The whole register and memory map is reachable through 4 SPI pins. Passes over SPI are bit-exact. During a decode loop with 200-cycle idle gaps between tokens, the core clock is off **90.8%** of the time. SPI bandwidth (0.78 MB/s), not compute, now limits the end-to-end token rate |
+| 12 | QSPI host port (0x32 quad write, 0x6B quad read, io[3:0]) | RTL merged | A full Q/K/V load drops from 1,069 µs to **286 µs** (3.7×). Bus time per decode token drops from 135 µs to **66.9 µs**, so the host-limited rate goes from 7,400 to about **15,000 tokens/s**. Plain SPI hosts still work |
 
 ### 1. Timing closure
 
@@ -501,8 +502,8 @@ MCU can drive. `raijin_chip` is the new tapeout top level:
 | Pin | Direction | Use |
 | --- | --- | --- |
 | clk, rst_n | in | core clock (50 MHz target), asynchronous reset |
-| sck, cs_n, mosi | in | SPI mode 0 |
-| miso (+ miso_oe) | out | SPI read data, driven only while selected |
+| sck, cs_n | in | SPI mode 0 |
+| io[3:0] (io_in / io_out / io_oe) | inout | io[0] MOSI and io[1] MISO in single-lane SPI, all four for QSPI data (feature 12). Driven only while selected |
 | done | out | pass finished; use it as the host interrupt |
 | busy | out | pass running |
 
@@ -577,4 +578,43 @@ the same floorplan as `sram_p2_v2`. The macro instances are renamed to
 `u_core.sram*`. It has not been run yet. The gated clock goes through the
 ICG, so CTS has to treat `u_icg/GCLK` as the core's clock root; that run will
 show whether it does.
+
+### 12. QSPI host port
+
+Feature 11 showed that the host link, not the datapath, now sets the
+end-to-end rate. QSPI uses the same pins plus io[2] and io[3], and the same
+command style as quad SPI flash:
+
+- `0x32 AH AL d0 d1 ...` is a quad write. The command and address are single
+  lane; each data byte takes two clocks on io[3:0], high nibble first.
+- `0x6B AH AL dummy d0 d1 ...` is a quad read. After the single-lane dummy
+  byte, the chip drives io[3:0] (io_oe = 1111) with one nibble per clock.
+- 0x02 and 0x0B are unchanged, so a single-lane host still works. Both forms
+  can be mixed freely on the same chip; the test interleaves them.
+
+The read prefetch still hides the core's latency: a byte now lasts 2 SCK
+periods, which is 16 core clocks at f_clk / 8, and the read needs 4.
+
+**Measured** (P = 4, SCK = 6.25 MHz, `results/chip_spi_N16_D16.txt` and
+`results/chip_qspi_N16_D16.txt`):
+
+| | SPI | QSPI | Gain |
+| --- | --- | --- | --- |
+| Q/K/V + exponent load (834 bytes) | 1,069 µs | 286 µs | 3.7× |
+| Bus time per decode token (103 bytes in 10 transactions) | 135 µs | 66.9 µs | 2.0× |
+| Host-limited decode rate, one head | 7,400 tokens/s | 15,000 tokens/s | 2.0× |
+| Core clock gated during the decode loop | 90.8% | 82.0% | — |
+
+Large bursts get close to the full 4×. Decode tokens gain only 2×, because
+each small transfer still spends 3 to 4 single-lane bytes on its command,
+address and dummy. The natural next step is a single *append token* burst:
+one transaction carrying the new token's Q, K and V rows and exponents, which
+the chip writes to the right rows, or to the right page with paging. That
+would cut the per-token overhead to one header. The gated share is lower with
+QSPI only because the loop takes less time overall. The core clock runs for
+exactly the same 10,296 cycles in both cases.
+
+`test_spi_registers` checks quad and single-lane bursts against each other.
+`test_qspi_passes` repeats the fused, causal, unfused and decode checks of
+feature 11 over QSPI. All of it is bit-exact.
 

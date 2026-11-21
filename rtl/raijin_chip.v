@@ -1,7 +1,8 @@
 // Raijin chip top (feature 11): SPI host port, idle clock gating, and the core.
 //
-// Pins: clk, rst_n, sck, cs_n, mosi, miso (+ miso_oe for the pad), done (IRQ),
-// busy. The SPI target runs on the free-running clock; the core runs on a
+// Pins: clk, rst_n, sck, cs_n, io[3:0] (bidirectional: io_in / io_out / io_oe
+// to the pads; io[0] MOSI and io[1] MISO in single-lane SPI, all four in QSPI),
+// done (IRQ), busy. The SPI target runs on the free-running clock; the core runs on a
 // gated clock that is on only while a pass runs and for HOLD cycles after each
 // bus access the SPI target makes, or after the pass ends. HOLD covers the
 // core's two-cycle write and three-cycle read latency, and lets done settle.
@@ -23,9 +24,9 @@ module raijin_chip #(
     input  wire rst_n,
     input  wire sck,
     input  wire cs_n,
-    input  wire mosi,
-    output wire miso,
-    output wire miso_oe,
+    input  wire [3:0] io_in,        // io[0] MOSI, io[1] MISO, io[3:0] quad data
+    output wire [3:0] io_out,
+    output wire [3:0] io_oe,
     output wire done,
     output wire busy,
     output reg  [31:0] gated_cycles     // free-running count of cycles the core clock was off
@@ -35,8 +36,8 @@ module raijin_chip #(
     wire        we, re, active;
 
     raijin_spi u_spi (
-        .clk(clk), .rst_n(rst_n), .sck(sck), .cs_n(cs_n), .mosi(mosi),
-        .miso(miso), .miso_oe(miso_oe), .active(active),
+        .clk(clk), .rst_n(rst_n), .sck(sck), .cs_n(cs_n),
+        .io_in(io_in), .io_out(io_out), .io_oe(io_oe), .active(active),
         .addr(addr), .wdata(wdata), .we(we), .re(re), .rdata(rdata));
 
     // ---- clock gate enable ----

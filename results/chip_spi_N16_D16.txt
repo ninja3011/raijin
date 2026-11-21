@@ -1,5 +1,5 @@
 spi fused=1 causal=0         cycles= 111
 spi fused=1 causal=1         cycles=  97
 spi fused=0 causal=0         cycles= 411
-spi load: 834 bytes for Q, K, V and exponents (1067.5 us at 6.25 MHz SCK)
-spi decode loop: 16 tokens, 1648 bytes, 111720 cycles, core clock gated 101424 cycles (90.8%)
+spi load: 834 bytes for Q, K, V and exponents, 1069.4 us on the bus
+spi decode loop: 16 tokens, 1648 bytes, 135.0 us of bus time per token (host-limited 7,405 tokens/s), 111720 cycles, core clock gated 101424 cycles (90.8%)

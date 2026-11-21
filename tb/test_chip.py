@@ -19,39 +19,65 @@ SCK_HALF_NS = 4 * CLK_NS       # SCK = f_clk / 8 = 6.25 MHz
 
 
 class Spi:
-    def __init__(self, dut):
-        self.dut = dut
-        self.bytes = 0
+    """SPI / QSPI host on the chip pins. quad=True uses 0x32 / 0x6B, which move
+    the data bytes on io[3:0] (command, address and dummy stay single lane)."""
 
-    async def _xfer(self, out_bytes, n_in=0):
+    def __init__(self, dut, quad=False):
+        self.dut = dut
+        self.quad = quad
+        self.bytes = 0
+        self.ns = 0
+
+    async def _clock(self, out_nib, width):
         d = self.dut
+        d.io_in.value = out_nib
+        await Timer(SCK_HALF_NS, unit="ns")
+        d.sck.value = 1
+        io = int(d.io_out.value)
+        await Timer(SCK_HALF_NS, unit="ns")
+        d.sck.value = 0
+        return io & 0xF if width == 4 else (io >> 1) & 1
+
+    async def _xfer(self, head, data=(), n_in=0, quad=False):
+        d = self.dut
+        t0 = cocotb.utils.get_sim_time("ns")
         got = []
         d.cs_n.value = 0
         await Timer(SCK_HALF_NS, unit="ns")
-        for i in range(len(out_bytes) + n_in):
-            b = out_bytes[i] if i < len(out_bytes) else 0
-            v = 0
+        for b in head:                                  # command, address, dummy
             for k in range(7, -1, -1):
-                d.mosi.value = (b >> k) & 1
-                await Timer(SCK_HALF_NS, unit="ns")
-                d.sck.value = 1
-                v = (v << 1) | int(d.miso.value)
-                await Timer(SCK_HALF_NS, unit="ns")
-                d.sck.value = 0
-            if i >= len(out_bytes):
-                got.append(v)
+                await self._clock((b >> k) & 1, 1)
+        for b in data:
+            if quad:
+                await self._clock((b >> 4) & 0xF, 4)
+                await self._clock(b & 0xF, 4)
+            else:
+                for k in range(7, -1, -1):
+                    await self._clock((b >> k) & 1, 1)
+        for _ in range(n_in):
+            v = 0
+            if quad:
+                v = (await self._clock(0, 4)) << 4
+                v |= await self._clock(0, 4)
+            else:
+                for _ in range(8):
+                    v = (v << 1) | await self._clock(0, 1)
+            got.append(v)
         await Timer(SCK_HALF_NS, unit="ns")
         d.cs_n.value = 1
         await Timer(2 * SCK_HALF_NS, unit="ns")
-        self.bytes += len(out_bytes) + n_in
+        self.bytes += len(head) + len(data) + n_in
+        self.ns += cocotb.utils.get_sim_time("ns") - t0
         return got
 
     async def write(self, addr, data):
         data = [int(x) & 0xFF for x in (data if hasattr(data, "__len__") else [data])]
-        await self._xfer([0x02, addr >> 8, addr & 0xFF] + data)
+        cmd = 0x32 if self.quad else 0x02
+        await self._xfer([cmd, addr >> 8, addr & 0xFF], data, quad=self.quad)
 
     async def read(self, addr, n=1):
-        return await self._xfer([0x0B, addr >> 8, addr & 0xFF, 0x00], n)
+        cmd = 0x6B if self.quad else 0x0B
+        return await self._xfer([cmd, addr >> 8, addr & 0xFF, 0x00], n_in=n, quad=self.quad)
 
     async def read32(self, addr):
         b = await self.read(addr, 4)
@@ -63,7 +89,7 @@ async def setup(dut):
     dut.rst_n.value = 0
     dut.cs_n.value = 1
     dut.sck.value = 0
-    dut.mosi.value = 0
+    dut.io_in.value = 0
     await ClockCycles(dut.clk, 3)
     dut.rst_n.value = 1
     await ClockCycles(dut.clk, 2)
@@ -109,20 +135,31 @@ async def test_spi_registers(dut):
     # exponent memory: a burst write then a burst read back
     await spi.write(0x4100, list(range(100, 100 + N)))
     assert await spi.read(0x4100, N) == list(range(100, 100 + N))
+    # the same over QSPI, and mixed: quad write, single read and back
+    spi.quad = True
+    vals = [(37 * i + 11) & 0xFF for i in range(N)]
+    await spi.write(0x4200, vals)
+    assert await spi.read(0x4200, N) == vals
+    spi.quad = False
+    assert await spi.read(0x4200, N) == vals
+    await spi.write(0x4200, vals[::-1])
+    spi.quad = True
+    assert await spi.read(0x4200, N) == vals[::-1]
 
 
-@cocotb.test()
-async def test_spi_passes(dut):
+async def run_passes(dut, quad):
     """Fused, causal and unfused passes, and KV-cache decode, all over SPI with
     the clock gate active. Bit-exact; records the SPI bytes per pass, the
     gated-clock share of an idle-heavy decode loop, and host-limited rates."""
     spi = await setup(dut)
+    spi.quad = quad
+    lane = "qspi" if quad else "spi"
     rng = np.random.default_rng(int(os.environ.get("RAIJIN_SEED", 7)) + 61)
     qf, kf, vf = rm.random_case(rng, n=N, d=D, scale=1.5)
     args = rm.prepare(qf, kf, vf)
-    spi.bytes = 0
+    spi.bytes, spi.ns = 0, 0
     await load(spi, *args)
-    load_bytes = spi.bytes
+    load_bytes, load_ns = spi.bytes, spi.ns
     summary = []
     for fused, causal in ((True, False), (True, True), (False, False)):
         exp = rm.attention(*args, fused=fused, mode=rm.MODE_EXACT, causal=causal)
@@ -130,7 +167,7 @@ async def test_spi_passes(dut):
         await wait_done(dut)
         o, eo = await read_out(spi, list(range(N)))
         cycles = await spi.read32(0x5004)
-        tag = f"spi fused={int(fused)} causal={int(causal)}"
+        tag = f"{lane} fused={int(fused)} causal={int(causal)}"
         assert np.array_equal(o, exp.o), f"{tag}: output mismatch\nrtl=\n{o}\nmodel=\n{exp.o}"
         assert np.array_equal(eo, exp.eo), f"{tag}: exponent mismatch"
         summary.append(f"{tag:28s} cycles={cycles:4d}")
@@ -138,7 +175,7 @@ async def test_spi_passes(dut):
     # decode loop: per token, write one K/V/Q row + exponents, start, read one row
     q, eq, k, ek, v, ev = args
     g0, t0 = int(dut.gated_cycles.value), cocotb.utils.get_sim_time("ns")
-    spi.bytes = 0
+    spi.bytes, spi.ns = 0, 0
     for t in range(N):
         for base, mat in ((0x0000, q), (0x1000, k), (0x2000, v)):
             await spi.write(base + t * D, mat[t])
@@ -149,17 +186,35 @@ async def test_spi_passes(dut):
         await wait_done(dut)
         o, eo = await read_out(spi, [t])
         exp = rm.attention_decode(q, eq, k, ek, v, ev, qrow=t, length=t + 1)
-        assert np.array_equal(o[t], exp.o[0]) and eo[t] == exp.eo[0], f"spi decode t={t}"
+        assert np.array_equal(o[t], exp.o[0]) and eo[t] == exp.eo[0], f"{lane} decode t={t}"
         # an idle gap between tokens, as when the host runs the rest of the model
         await ClockCycles(dut.clk, 200)
     total = (cocotb.utils.get_sim_time("ns") - t0) / CLK_NS
     gated = int(dut.gated_cycles.value) - g0
-    summary.append(f"spi load: {load_bytes} bytes for Q, K, V and exponents "
-                   f"({load_bytes * 8 * 2 * SCK_HALF_NS / 1000:.1f} us at 6.25 MHz SCK)")
-    summary.append(f"spi decode loop: {N} tokens, {spi.bytes} bytes, {total:.0f} cycles, "
+    per_tok_us = spi.ns / N / 1000
+    summary.append(f"{lane} load: {load_bytes} bytes for Q, K, V and exponents, {load_ns / 1000:.1f} us on the bus")
+    summary.append(f"{lane} decode loop: {N} tokens, {spi.bytes} bytes, {per_tok_us:.1f} us of bus time per token "
+                   f"(host-limited {1e6 / per_tok_us:,.0f} tokens/s), {total:.0f} cycles, "
                    f"core clock gated {gated} cycles ({100 * gated / total:.1f}%)")
     for line in summary[-2:]:
         dut._log.info(line)
     assert gated > 0
+    return summary
+
+
+@cocotb.test()
+async def test_spi_passes(dut):
+    """Fused, causal and unfused passes, and KV-cache decode, all over single-
+    lane SPI with the clock gate active. Bit-exact; records the bus bytes and
+    time per pass and per token, and the gated-clock share of a decode loop."""
+    summary = await run_passes(dut, quad=False)
     with open(os.path.join(os.path.dirname(__file__), "..", "results", f"chip_spi_N{N}_D{D}.txt"), "w") as f:
+        f.write(chr(10).join(summary) + chr(10))
+
+
+@cocotb.test()
+async def test_qspi_passes(dut):
+    """The same passes and decode loop over QSPI (0x32 / 0x6B)."""
+    summary = await run_passes(dut, quad=True)
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", f"chip_qspi_N{N}_D{D}.txt"), "w") as f:
         f.write(chr(10).join(summary) + chr(10))
