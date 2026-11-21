@@ -56,6 +56,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 | --- | --- | --- | --- |
 | 1 | Timing closure: four copies each of 1/l and the output shift amount (`rtl/raijin_dupreg.v`) | RTL merged; layout running | Cycles unchanged (357). The clock target is 50 MHz, which would give 2.29 GOPS (estimate) |
 | 2 | Group pipelining in the fused dataflow | RTL merged | Fused pass 357 → **173** cycles at P = 2 (2.06×, 74% utilization) and 197 → **111** at P = 4 (1.77×). That is 3.9 GOPS at 42 MHz, or 4.7 GOPS at 50 MHz. Unfused and decode are unchanged |
+| 3 | Causal prefill (CTRL bit 5) | RTL merged | One causal fused pass: **153** cycles at P = 2 and **97** at P = 4. Building the same outputs from 16 decode steps takes about 650 cycles at P = 2 and 680 at P = 4, so prefill is 4.2× to 7× faster, before counting the host traffic each decode step needs |
 
 ### 1. Timing closure
 
@@ -101,3 +102,34 @@ hardening run.
 group) and the unfused dataflow keep their old control path. Setting
 `RAIJIN_TRACE=1` for `tb/run_tests.py` prints a per-cycle trace of the
 pipelined controller.
+
+### 3. Causal prefill
+
+Decoder models (GPT- and Llama-class) need causal attention: row i may only
+attend to keys 0..i. Before this change, a full pass was non-causal, so a
+prompt's KV cache could only be built one decode step at a time. Setting CTRL
+bit 5 (fused, non-decode) now makes the pass causal.
+
+- **Work is skipped, not just masked.** Group g streams only keys
+  0 .. gP+P−1, so the pass processes about N²/2 key-row pairs instead of N².
+- **Per-lane mask.** Inside a group's last P keys, lane r masks key j when
+  j > gP + r. A masked key leaves m and l untouched and carries p = 0, so the
+  accumulators skip it. The lane flags it on `out_mask`, so it isn't counted
+  as an underflow skip.
+- **Minimum group spacing.** Causal groups can be only 2P cycles long, which
+  is shorter than the reciprocal (14 cycles) plus the output issue. A group
+  may issue its last key only L_MIN = 14 + P cycles after the previous
+  group's last key. Non-causal groups are 16 + P cycles long, so they never
+  stall. That spacing is what holds causal at 153 cycles instead of about 110.
+  A two-deep reciprocal and snapshot would remove the stall; that is noted as
+  a follow-up.
+- **Numerics.** e_vmax is still taken over all N V rows, as in a full pass.
+  The golden model is `attention(..., fused=True, causal=True)`.
+
+Measured accuracy against FP32 causal attention, as the mean per-row cosine
+(`results/causal_N16_D16.txt`): 0.99984 random, 0.99992 sharp and 0.99981
+with outliers in the exact mode, and 0.9992 to 0.9999 in MF2 mode.
+
+The test `test_causal_prefill` covers three tensor families, all three exp
+modes and two requant offsets. It is bit-exact with the model, and it checks
+that a non-causal pass straight after a causal one is unaffected.

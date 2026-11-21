@@ -12,6 +12,13 @@
 // while group g+1 streams. O rows queue in a small FIFO and are written on the
 // port-0 cycles that carry no V read.
 //
+// Causal pass (CTRL bit 5, fused only): row i attends to keys 0..i. Group g
+// streams only keys 0..gP+P-1, so the pass does about half the work, and the
+// lanes mask the keys above their own row within the group's last P keys.
+// A group may issue its last key only L_MIN cycles after the previous group's
+// last key, so short causal groups never overrun the reciprocal and output
+// stages of the group before them.
+//
 // Storage: Q, K, V, O and the score buffer live in four 1 KB SRAM macros
 // (sky130_sram_1kbyte_1rw1r_32x256_8, one RW and one R port each). Bank b holds
 // bytes 4b..4b+3 of every row, so the four banks together return one full
@@ -35,7 +42,8 @@
 //   0x3rcc  O[r][c]   (read)           0x4300+r  e_o[r]  (read)
 //   (offset = r * D + c)
 //   0x5000  CTRL   w: bit0 start, bit1 fused, bits3:2 mode (0 exact, 1 MF1, 2 MF2),
-//                     bit4 decode (implies the fused dataflow)
+//                     bit4 decode (implies the fused dataflow),
+//                     bit5 causal (fused, non-decode: row i sees keys 0..i)
 //   0x5001  OFFSET signed score requant offset
 //   0x5002  STATUS bit0 busy, bit1 done
 //   0x5003  RD_LATENCY (3)
@@ -118,7 +126,7 @@ module raijin_core #(
     // Control registers
     // ------------------------------------------------------------------
     reg               busy_r, done_r;
-    reg               fused, decode;
+    reg               fused, decode, causal;
     reg [1:0]         mode;
     reg signed [7:0]  offset;
     reg [LN:0]        len;
@@ -129,6 +137,8 @@ module raijin_core #(
     wire mf = (mode != 2'd0);
     wire [LP-1:0] qlane = qrow % P;
     wire          pipe  = fused && !decode;   // group-pipelined fused pass
+    localparam    L_MIN = 14 + P;             // min cycles between two groups' last keys
+    reg  [4:0]    since_last;                 // cycles since the last group's last key
 
     // ------------------------------------------------------------------
     // Bus decode
@@ -221,7 +231,8 @@ module raijin_core #(
     end
 
     // ---- port 1 (read only): K rows, Q rows, score buffer reads ----
-    wire k_rd = (state == U_QK) || (state == F_STREAM);
+    wire fstall;
+    wire k_rd = (state == U_QK) || ((state == F_STREAM) && !fstall);
     wire q_rd = (state == Q_LOAD);
     wire s_rd = (state == U_SM_P1) || (state == U_SM_P2) || (state == U_PV);
     integer pb;
@@ -352,7 +363,10 @@ module raijin_core #(
     wire [P*13-1:0] sm_r;
     wire [P-1:0]    sm_ofirst, sm_olast;
     wire            sm_first = pipe && (sm_tag_in[LN-1:0] == {LN{1'b0}});
-    wire            sm_last  = pipe && (sm_tag_in[LN-1:0] == N - 1);
+    wire [LG-1:0]   sm_g     = sm_tag_in[LN +: LG];
+    wire [LN-1:0]   sm_j     = sm_tag_in[LN-1:0];
+    wire            sm_last  = pipe && (causal ? (sm_j == sm_g * P + P - 1) : (sm_j == N - 1));
+    wire [P-1:0]    sm_omask;
 
     generate
         for (gr = 0; gr < P; gr = gr + 1) begin : g_sm
@@ -364,10 +378,11 @@ module raijin_core #(
                 .s_valid(sm_valid), .s(s_in), .tag(sm_tag_in),
                 .m_update(sm_mupd), .emit(sm_emit),
                 .first(sm_first), .last(sm_last),
+                .mask(causal && (sm_j > sm_g * P + gr)),
                 .out_valid(sm_ovalid[gr]), .out_tag(sm_otag[gr*TW +: TW]),
                 .out_p(sm_p[gr*9 +: 9]), .out_sa(sm_sa[gr*4 +: 4]), .out_sb(sm_sb[gr*4 +: 4]),
                 .out_delta(sm_delta[gr*5 +: 5]),
-                .out_first(sm_ofirst[gr]), .out_last(sm_olast[gr]),
+                .out_first(sm_ofirst[gr]), .out_last(sm_olast[gr]), .out_mask(sm_omask[gr]),
                 .m(m_unused), .l(l_unused),
                 .recip_start(rcp_go), .r_valid(sm_rvalid[gr]), .r(sm_r[gr*13 +: 13])
             );
@@ -429,7 +444,7 @@ module raijin_core #(
             end
         end
         for (ai = 0; ai < P; ai = ai + 1) begin
-            acc_lane[ai] = !decode || (qlane == ai);
+            acc_lane[ai] = (!decode || (qlane == ai)) && !(fused && sm_omask[ai]);
             acc_en[ai]   = acc_valid && acc_lane[ai] && (acc_p[ai*9 +: 9] != 9'd0);
         end
     end
@@ -704,7 +719,9 @@ module raijin_core #(
     // Controller FSM
     // ------------------------------------------------------------------
     wire last_j  = (j == N - 1);
-    wire last_jf = decode ? ({1'b0, j} == len - 1'b1) : last_j;
+    wire last_jf = decode ? ({1'b0, j} == len - 1'b1) :
+                   causal ? (j == g * P + P - 1) : last_j;
+    assign fstall = pipe && last_jf && (since_last < L_MIN);
     wire last_g  = (g == NG - 1);
 
     always @(posedge clk or negedge rst_n) begin
@@ -714,6 +731,8 @@ module raijin_core #(
             done_r <= 1'b0;
             fused  <= 1'b0;
             decode <= 1'b0;
+            causal <= 1'b0;
+            since_last <= 5'd31;
             mode   <= 2'd0;
             offset <= 8'sd0;
             len    <= N;
@@ -728,6 +747,8 @@ module raijin_core #(
             owr_cnt <= 0;
         end else begin
             if (oq_pop) owr_cnt <= owr_cnt + 1'b1;
+            if (state == F_STREAM && pipe && last_jf && !fstall) since_last <= 5'd0;
+            else if (since_last != 5'd31)                         since_last <= since_last + 1'b1;
             if (we_r && creg && !busy_r) begin
                 if (cidx == 5'h01) offset <= wdata_r;
                 if (cidx == 5'h10) len    <= wdata_r[LN:0];
@@ -742,6 +763,8 @@ module raijin_core #(
                     if (start_w) begin
                         fused  <= wdata_r[1] | wdata_r[4];
                         decode <= wdata_r[4];
+                        causal <= wdata_r[5] && wdata_r[1] && !wdata_r[4];
+                        since_last <= 5'd31;
                         mode   <= wdata_r[3:2];
                         busy_r <= 1'b1;
                         done_r <= 1'b0;
@@ -858,7 +881,7 @@ module raijin_core #(
                     qcnt  <= 0;
                     state <= Q_LOAD;
                 end
-                F_STREAM: begin
+                F_STREAM: if (!fstall) begin
                     j <= j + 1'b1;
                     if (last_jf) begin
                         if (pipe && !last_g) begin

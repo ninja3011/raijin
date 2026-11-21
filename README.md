@@ -8,6 +8,10 @@ unit. One controller runs attention two ways on the same hardware:
 - **Fused**: keys stream past four query rows with base-2 online softmax, so the
   N×N score matrix is never stored.
 
+A causal flag (CTRL bit 5) makes the fused pass causal, for prompt prefill in
+decoder models. Fused query groups are pipelined back to back
+(`docs/performance.md`).
+
 A third mode, decode, is one KV-cache step of autoregressive generation: one
 query row attends to the LEN keys and values already held in SRAM.
 

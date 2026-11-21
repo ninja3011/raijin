@@ -147,7 +147,11 @@ class PassResult:
 
 
 def attention(q, eq, k, ek, v, ev, *, fused: bool, mode: int = MODE_EXACT,
-              offset: int = 0) -> PassResult:
+              offset: int = 0, causal: bool = False) -> PassResult:
+    """Full attention pass. causal (fused only): row i sees keys 0..i; masked
+    keys are not processed at all (and not counted as skips). e_vmax is still
+    taken over all N V rows, as in the RTL."""
+    assert fused or not causal
     q, k, v = (np.asarray(a, dtype=np.int64) for a in (q, k, v))
     eq, ek, ev = (np.asarray(a, dtype=np.int64) for a in (eq, ek, ev))
     n, d = q.shape
@@ -165,7 +169,7 @@ def attention(q, eq, k, ek, v, ev, *, fused: bool, mode: int = MODE_EXACT,
         lsum = 0
         if fused:
             m = M_INIT
-            for j in range(n):
+            for j in range(i + 1 if causal else n):
                 mn = max(m, ceil_int(s[j]))
                 delta = mn - m
                 m = mn

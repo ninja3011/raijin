@@ -67,10 +67,10 @@ async def load(bus, q, eq, k, ek, v, ev):
             await bus.write(base + r, int(ex[r]))
 
 
-async def run_pass(bus, fused, mode, offset=0):
+async def run_pass(bus, fused, mode, offset=0, causal=False):
     dut = bus.dut
     await bus.write(0x5001, offset)
-    await bus.write(0x5000, 1 | (int(fused) << 1) | (mode << 2))
+    await bus.write(0x5000, 1 | (int(fused) << 1) | (mode << 2) | (int(causal) << 5))
     await wait_done(dut)
     return await read_out(bus)
 
@@ -213,4 +213,39 @@ async def test_decode_kv_cache(dut):
                 summary.append(f"decode {name:8s} mode={mode} len={t + 1:2d} cycles={cycles:4d} cos={cos:.5f}")
                 dut._log.info(summary[-1])
     with open(os.path.join(os.path.dirname(__file__), "..", "results", f"decode_N{N}_D{D}.txt"), "w") as f:
+        f.write(chr(10).join(summary) + chr(10))
+
+
+@cocotb.test()
+async def test_causal_prefill(dut):
+    """Causal prefill in one fused pass: row i attends to keys 0..i. Bit-exact
+    with the model, compared with FP32 causal attention, and timed against
+    building the same outputs with N decode steps."""
+    bus = await setup(dut)
+    rng = np.random.default_rng(int(os.environ.get("RAIJIN_SEED", 7)) + 11)
+    summary = []
+    for name, kw in CASES:
+        qf, kf, vf = rm.random_case(rng, n=N, d=D, **kw)
+        args = rm.prepare(qf, kf, vf)
+        await load(bus, *args)
+        ref = rm.reference_causal(qf, kf, vf)
+        for mode in (rm.MODE_EXACT, rm.MODE_MF1, rm.MODE_MF2):
+            for off in (0, 2):
+                exp = rm.attention(*args, fused=True, mode=mode, offset=off, causal=True)
+                o, eo, cycles, skips = await run_pass(bus, True, mode, offset=off, causal=True)
+                tag = f"causal {name} mode={mode} off={off}"
+                assert np.array_equal(o, exp.o), f"{tag}: output mismatch\nrtl=\n{o}\nmodel=\n{exp.o}"
+                assert np.array_equal(eo, exp.eo), f"{tag}: exponent mismatch rtl={eo} model={exp.eo}"
+                assert skips == exp.skips, f"{tag}: skips rtl={skips} model={exp.skips}"
+                if off == 0:
+                    got = rm.mx_dequantize(o, eo)
+                    cos = float(np.mean([np.dot(got[i], ref[i]) / np.linalg.norm(got[i]) /
+                                         np.linalg.norm(ref[i]) for i in range(N)]))
+                    summary.append(f"{tag:30s} cycles={cycles:4d} skips={skips:3d} mean_row_cos={cos:.5f}")
+                    dut._log.info(summary[-1])
+        # a plain fused pass right after a causal one must be unaffected
+        exp = rm.attention(*args, fused=True, mode=rm.MODE_EXACT)
+        o, eo, _, _ = await run_pass(bus, True, rm.MODE_EXACT)
+        assert np.array_equal(o, exp.o) and np.array_equal(eo, exp.eo), f"{name}: non-causal after causal"
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", f"causal_N{N}_D{D}.txt"), "w") as f:
         f.write(chr(10).join(summary) + chr(10))
