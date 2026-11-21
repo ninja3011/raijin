@@ -68,6 +68,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 | 13 | Token window (region 0x6000): one write burst and one read burst per decode token | RTL merged | Bus time per decode token over QSPI 66.9 → **36.2 µs**, about **27,700 tokens/s** host-limited: 3.7× the single-lane SPI baseline of feature 11. Works with paging and RoPE |
 | 14 | Per-page mixed KV precision (PAGED bit 1, PFMT 0x501B) | RTL merged | 24 tokens in the 16-word cache: 2 INT8 pages + 4 INT4 pages. On sharp attention, mean decode cosine 0.9656 (all INT4) → **0.9914** with INT8 for the sink page and the worst-error page. No cycle cost |
 | 15 | Heavy-hitter tracker for KV eviction (region 0x7000, `rtl/raijin_hh.v`) | RTL merged | Per-slot accumulators of attention weight and an on-chip argmin (HHMIN) give the host its H2O eviction victim with one byte read, also in the token window. Decode step 50 → **62** cycles at LEN = 16 with the tracker on, unchanged when off. Bit-exact with the model. On the char LMs, chip H2O matches FP H2O within 0.25% and beats a sliding window at budget 16 (4.608 vs 4.633), but loses at budget 8 |
+| 16 | MXFP4 KV elements (KVFMT bits 2, 3: E2M1 nibbles) | RTL merged | Same storage and cycles as MXINT4; a 16-entry nibble decoder in front of the shared INT8 datapath. Bit-exact in full passes, 2N-token decode and mixed paging. Row RMS error 0.128 → **0.109**; with K and V both 4-bit, char-LM cost +3.33% → **+2.61%** (Tiny Shakespeare) and +2.96% → **+2.71%** (WikiText-2). V-only is a wash |
 
 ### 1. Timing closure
 
@@ -820,30 +821,99 @@ with exact probabilities, as published). Perplexity over positions t ≥ B,
   32 accumulators, and can mix them with recency, decay them (halve) or use
   them to choose INT8 pages in feature 14.
 
+### 16. MXFP4 KV elements
+
+The OCP Microscaling spec defines two 4-bit element types under the same
+E8M0 block scale: INT4 and FP4 (E2M1: a sign, a 2-bit exponent and one
+mantissa bit, values 0, 0.5, 1, 1.5, 2, 3, 4, 6). Feature 6 used INT4. FP4
+spends its codes unevenly, densely near zero and sparsely near the block
+maximum, which suits bell-shaped K and V rows better than a uniform grid.
+
+**Hardware.** KVFMT bit 2 makes every 4-bit K token MXFP4, bit 3 every 4-bit
+V token. They combine with bits 0 and 1 (which tensors are 4-bit) and with
+mixed per-page precision (feature 14), so the formats per tensor are INT8,
+INT4 or FP4. Twice an E2M1 value is an integer, 2|x| in {0, 1, 2, 3, 4, 6, 8,
+12}, so a nibble widens to INT8 as ±(2|x|) << 3 = 16x. That is the same scale
+as an INT4 nibble (x4 << 4), so the host's exponent rule, the score path, the
+V accumulator and the output requantiser are all unchanged. The only new logic
+is a 3-bit lookup and a conditional negate per element, in the two places the
+INT4 unpack already sits (K row into the DPUs, V row into the accumulators).
+No cycles are added.
+
+**Host quantiser.** Per 16-element row, the host tries the exponent at which
+the row maximum just fits (|x| ≤ 6) and the one below it (the maximum clips to
+6, everything else gets a twice-finer grid), and keeps the one with lower
+squared error. The chip only sees the exponent, so this costs nothing on
+chip; it lowers the RMS error from 0.113 to 0.109 on Gaussian rows.
+
+**Verification** (`tb/test_core.py::test_fp4_kv_cache`,
+`results/fp4_kv_N16_D16.txt`): unfused, fused and causal passes with K and V
+in FP4, a 32-token decode cache for the three score families, K8/V-FP4 causal
+passes in exact and MF2 modes, and 24 decode steps of mixed paging with INT8
+pages 0 and 5 and FP4 pages in between. Every output is bit-exact with the
+model.
+
+**Accuracy.** `eval/kv_formats.py` (`results/kv_formats.txt`) runs every K/V
+format pair on the model, 32-token causal decode, 16 cases per family, mean
+cosine against FP32:
+
+| K | V | Bits per token | random | sharp | outliers |
+| --- | --- | --- | --- | --- | --- |
+| INT8 | INT8 | 272 | 0.99985 | 0.99964 | 0.99952 |
+| INT8 | INT4 | 208 | 0.99202 | 0.99142 | 0.99144 |
+| INT8 | FP4 | 208 | **0.99444** | **0.99433** | **0.99393** |
+| INT4 | INT4 | 144 | 0.98667 | 0.95942 | 0.97308 |
+| FP4 | FP4 | 144 | **0.99057** | **0.96351** | **0.97528** |
+
+In the language models (tables in the evaluation section below):
+
+| Model | K8 V-INT4 | K8 V-FP4 | K4 V4 INT4 | K4 V4 FP4 |
+| --- | --- | --- | --- | --- |
+| Tiny Shakespeare | +0.81% | **+0.64%** | +3.33% | **+2.61%** |
+| WikiText-2 | **+0.44%** | +0.55% | +2.96% | **+2.71%** |
+
+- FP4 has 15% lower row RMS error than INT4 (0.109 against 0.128) and a
+  higher mean cosine in every synthetic pair.
+- Where K is 4-bit, FP4 is clearly better on both models: it removes 8% to
+  22% of the INT4 loss at the same storage.
+- For V alone the two are within 0.2% of each other and the winner depends
+  on the dataset, so the default operating point keeps V in INT4. FP4 is the
+  better choice for an all-4-bit cache.
+- Single cases can still go the other way: the test's sharp 32-token case
+  has a lower mean cosine with FP4 (0.947 against 0.975), because one key's
+  largest element lands in the coarse 4 to 6 step. Mixed paging can put such a
+  page in INT8.
+- MXFP8 (E4M3) elements would need a real floating-point multiplier in the
+  DPU and are left as future work.
+
 ## Evaluation inside a real transformer
 
 `eval/lm.py` trains a small character-level language model on Tiny Shakespeare (4 layers, d_model 128, 8 heads of d = 16, RoPE, context 32, 810k parameters, 4000 steps, validation loss about 1.31) and then swaps every attention head for a bit-exact model of the chip (`model/raijin_vec.py`, checked against `model/raijin_model.py`). Q is quantised to MXINT8 per 16-element row with the 1/sqrt(d) log2(e) scale folded in, as the host driver does; K and V go through the same quantiser the chip's KV cache uses. Perplexity is measured on 256 validation sequences (8,192 predicted characters). Raw output: `results/lm_perplexity.txt` and `.json`. Reproduce with `python3 eval/lm.py train` then `python3 eval/lm.py eval`.
 
 | Variant | Perplexity | Change | Top-1 | Keys with zero weight |
 |---|---|---|---|---|
-| FP32 attention | 4.6230 | baseline | 54.58% | 0.0% |
-| MXINT8, exact exp2 | 4.6300 | +0.15% | 54.60% | 15.1% |
-| MXINT8, MF1 (one shift) | 4.6417 | +0.40% | 54.36% | 13.8% |
-| MXINT8, MF2 (two shifts, default) | 4.6321 | +0.19% | 54.55% | 14.4% |
-| Key skip, SKIPTHR = 6 | 4.6310 | +0.17% | 54.47% | 24.7% |
-| Key skip, SKIPTHR = 4 | 4.6384 | +0.33% | 54.22% | 37.8% |
-| Key skip, SKIPTHR = 2 | 4.7445 | +2.63% | 53.86% | 54.1% |
-| K INT8, V INT4 | 4.6533 | +0.65% | 54.33% | 15.0% |
-| K INT4, V INT4 | 4.8043 | +3.92% | 53.43% | 15.8% |
-| INT4 with INT8 sink and worst page (feature 14) | 4.7324 | +2.36% | 53.59% | 15.5% |
-| K INT8, V INT4, SKIPTHR = 6 | 4.6564 | +0.72% | 54.16% | 24.6% |
-| **Operating point: MF2, K INT8, V INT4, SKIPTHR = 6** | **4.6625** | **+0.85%** | 54.20% | 24.6% |
+| FP32 attention | 4.8515 | baseline | 52.81% | 0.0% |
+| MXINT8, exact exp2 | 4.8588 | +0.15% | 52.77% | 15.1% |
+| MXINT8, MF1 (one shift) | 4.8702 | +0.39% | 52.80% | 13.8% |
+| MXINT8, MF2 (two shifts, default) | 4.8551 | +0.07% | 52.78% | 14.4% |
+| Key skip, SKIPTHR = 6 | 4.8587 | +0.15% | 52.83% | 24.7% |
+| Key skip, SKIPTHR = 4 | 4.8814 | +0.62% | 52.71% | 37.9% |
+| Key skip, SKIPTHR = 2 | 5.0047 | +3.16% | 52.00% | 54.2% |
+| K INT8, V INT4 | 4.8907 | +0.81% | 52.58% | 15.0% |
+| K INT8, V MXFP4 (feature 16) | 4.8827 | +0.64% | 52.62% | 15.1% |
+| K INT4, V INT4 | 5.0130 | +3.33% | 51.82% | 15.7% |
+| K MXFP4, V MXFP4 (feature 16) | 4.9782 | +2.61% | 52.04% | 15.4% |
+| INT4 with INT8 sink and worst page (feature 14) | 4.9746 | +2.54% | 52.19% | 15.5% |
+| K INT8, V INT4, SKIPTHR = 6 | 4.8915 | +0.83% | 52.44% | 24.6% |
+| **Operating point: MF2, K INT8, V INT4, SKIPTHR = 6** | **4.8863** | **+0.72%** | 52.48% | 24.6% |
 
 What this shows:
-- The chip's arithmetic (MXINT8 operands, base-2 online softmax with the two-shift exponent and the chip's reciprocal) costs 0.19% perplexity in a real model. That is within the noise of retraining.
-- Key skip at SKIPTHR = 6 is free (+0.17%, within 0.02% of no skip) and zeroes a quarter of the keys, so their V reads are gated off. SKIPTHR = 4 still costs only 0.33% and skips 38%. SKIPTHR = 2 is too aggressive.
-- V is much more tolerant of INT4 than K: K8/V4 costs 0.65%, K4/V4 costs 3.9%. Keeping the sink page and the worst page in INT8 (feature 14) recovers 40% of the INT4 loss for the cost of two INT8 pages, so per-page precision is worth its hardware.
-- Recommended operating point for edge decode: MF2, SKIPTHR = 6, K INT8 / V INT4. Measured together, the cost is +0.85% perplexity for half the V storage and a quarter fewer V reads. (Rows other than the MF1/MF2 ones use the exact exponent, 4.6300, as their reference.)
+- The chip's arithmetic (MXINT8 operands, base-2 online softmax with the two-shift exponent and the chip's reciprocal) costs 0.07% to 0.15% perplexity in a real model. That is within the noise of retraining.
+- Key skip at SKIPTHR = 6 is free (4.8587 against 4.8588 with no skip) and zeroes a quarter of the keys, so their V reads are gated off. SKIPTHR = 4 costs 0.62% and skips 38%. SKIPTHR = 2 is too aggressive.
+- V is much more tolerant of 4 bits than K: K8/V4 costs 0.81%, K4/V4 costs 3.3%. Keeping the sink page and the worst page in INT8 (feature 14) recovers a quarter of the INT4 loss for the cost of two INT8 pages.
+- MXFP4 elements (feature 16) help most where K is 4-bit: K-FP4/V-FP4 costs 2.61% against 3.33% for INT4, in the same 144 bits per token. For V alone the two formats are within noise of each other (FP4 is better here, INT4 on WikiText-2).
+- Recommended operating point for edge decode: MF2, SKIPTHR = 6, K INT8 / V INT4. Measured together, the cost is +0.72% perplexity for half the V storage and a quarter fewer V reads. (Rows other than the MF1/MF2 ones use the exact exponent, 4.8588, as their reference.)
+- The numbers in this table were re-run on 256 evenly spaced validation windows, the same sampling as WikiText-2. An earlier version of this section used 256 random windows (FP32 4.6230); every conclusion is unchanged.
 
 ### Second benchmark: WikiText-2
 
@@ -853,17 +923,20 @@ The same model, trained from scratch on the WikiText-2 training split (Merity et
 |---|---|---|---|---|
 | FP32 attention | 3.7133 | baseline | 1.8927 | 0.0% |
 | MXINT8, exact exp2 | 3.7157 | +0.06% | 1.8936 | 16.7% |
-| MXINT8, MF1 | 3.7248 | +0.31% | 1.8972 | 15.3% |
-| MXINT8, MF2 | 3.7147 | +0.04% | 1.8933 | 16.0% |
+| MXINT8, MF1 (one shift) | 3.7248 | +0.31% | 1.8972 | 15.3% |
+| MXINT8, MF2 (two shifts, default) | 3.7147 | +0.04% | 1.8933 | 16.0% |
 | Key skip, SKIPTHR = 6 | 3.7160 | +0.07% | 1.8937 | 26.5% |
 | Key skip, SKIPTHR = 4 | 3.7209 | +0.20% | 1.8956 | 39.3% |
 | Key skip, SKIPTHR = 2 | 3.7708 | +1.55% | 1.9149 | 54.6% |
 | K INT8, V INT4 | 3.7296 | +0.44% | 1.8990 | 16.6% |
-| K INT4, V INT4 | 3.8298 | +3.14% | 1.9373 | 17.5% |
-| INT4 with INT8 sink and worst page | 3.7904 | +2.07% | 1.9223 | 17.1% |
-| **Operating point: MF2, K8 V4, SKIPTHR = 6** | **3.7324** | **+0.51%** | 1.9001 | 26.4% |
+| K INT8, V MXFP4 (feature 16) | 3.7338 | +0.55% | 1.9006 | 16.7% |
+| K INT4, V INT4 | 3.8234 | +2.96% | 1.9348 | 17.3% |
+| K MXFP4, V MXFP4 (feature 16) | 3.8139 | +2.71% | 1.9313 | 17.1% |
+| INT4 with INT8 sink and worst page (feature 14) | 3.7961 | +2.23% | 1.9245 | 17.1% |
+| K INT8, V INT4, SKIPTHR = 6 | 3.7308 | +0.47% | 1.8995 | 26.4% |
+| **Operating point: MF2, K INT8, V INT4, SKIPTHR = 6** | **3.7324** | **+0.51%** | 1.9001 | 26.4% |
 
-The ranking of every variant is the same as on Tiny Shakespeare, and every cost is a little smaller, so the conclusions above are not an artefact of one dataset.
+The ranking of the variants is the same as on Tiny Shakespeare, except that V-only MXFP4 and V-only INT4 swap places (they are within 0.1% of each other on both), and every cost is a little smaller, so the conclusions above are not an artefact of one dataset.
 
 **Range of the softmax sum.** The l register is 13 bits (Q5.8), so it holds sums up to 31.99. Each key adds at most 1.0, so a pass over 32 or more keys with nearly flat attention could wrap it. The vector model counts every step where the 13-bit register would wrap: none occurred in either benchmark at context 32. Contexts beyond 31 keys in one pass (the 32-token INT4 cache with flat attention, or the scaling model's N = 512) need l widened to log2(N) + 8 bits. That is a parameter change in `raijin_softmax_lane.v` and the reciprocal, and it is listed as future work.
 
@@ -906,15 +979,15 @@ The 3.4x jump is an artefact of vectorless activity, not a real cost. The SRAM d
 
 | Configuration | Prefill | Decode | Tokens/s | KV bytes per token per head | V-row reads per token | Perplexity |
 |---|---|---|---|---|---|---|
-| Baseline (sram-kv) | 96.5 ms | 24,832 cycles | 1,812 | 136 | 6,140 | 4.6300 |
-| + group pipelining (2) | 96.5 ms | 24,832 | 1,812 | 136 | 6,140 | 4.6300 |
-| + causal prefill (3) | **23.5 ms** | 24,832 | 1,812 | 136 | 6,140 | 4.6300 |
-| + GQA decode (4) | 23.5 ms | **6,214** | **7,242** | 136 | **1,535** | 4.6300 |
-| + INT4 V cache (6) | 23.5 ms | 6,214 | 7,242 | **104** | 1,535 | 4.6533 |
-| + key skip, SKIPTHR = 6 (8) | 23.5 ms | 6,214 | 7,242 | 104 | **1,156** | 4.6564 |
-| + MF2 exponent | 23.5 ms | 6,214 | 7,242 | 104 | 1,156 | 4.6625 |
+| Baseline (sram-kv) | 96.5 ms | 24,832 cycles | 1,812 | 136 | 6,140 | 4.8588 |
+| + group pipelining (2) | 96.5 ms | 24,832 | 1,812 | 136 | 6,140 | 4.8588 |
+| + causal prefill (3) | **23.5 ms** | 24,832 | 1,812 | 136 | 6,140 | 4.8588 |
+| + GQA decode (4) | 23.5 ms | **6,214** | **7,242** | 136 | **1,535** | 4.8588 |
+| + INT4 V cache (6) | 23.5 ms | 6,214 | 7,242 | **104** | 1,535 | 4.8907 |
+| + key skip, SKIPTHR = 6 (8) | 23.5 ms | 6,214 | 7,242 | 104 | **1,156** | 4.8915 |
+| + MF2 exponent | 23.5 ms | 6,214 | 7,242 | 104 | 1,156 | 4.8863 |
 
-Overall: prefill 4.1x faster, decode 4.0x faster, KV storage 1.31x smaller, V reads 5.3x fewer, for +0.85% perplexity against FP32 attention.
+Overall: prefill 4.1x faster, decode 4.0x faster, KV storage 1.31x smaller, V reads 5.3x fewer, for +0.72% perplexity against FP32 attention.
 
 What the ablation says about each feature:
 - **Causal prefill** is the biggest prefill win: without it a causal prompt has to be built from one decode step per token.

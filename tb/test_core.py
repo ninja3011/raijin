@@ -441,6 +441,155 @@ async def test_int4_kv_cache(dut):
         f.write(chr(10).join(summary) + chr(10))
 
 
+def _cos(a, b):
+    return float(np.dot(a, b) / np.linalg.norm(a) / np.linalg.norm(b))
+
+
+@cocotb.test()
+async def test_fp4_kv_cache(dut):
+    """MXFP4 K/V (KVFMT bits 2, 3): E2M1 nibbles in the same packed layout as
+    MXINT4. Full passes and a 2N-token decode cache are bit-exact with the
+    model; accuracy is compared with MXINT4 and MXINT8 caches run on the model.
+    Then K8/V-FP4, and FP4 pages in mixed-precision paging."""
+    bus = await setup(dut)
+    await bus.write(0x5012, 0xF)
+    assert await bus.read(0x5012) == 0xF
+    rng = np.random.default_rng(int(os.environ.get("RAIJIN_SEED", 7)) + 97)
+    summary = []
+
+    async def load_kvf(q, eq, k, ek, v, ev):
+        for r in range(N):
+            for c in range(D):
+                await bus.write(0x0000 + r * D + c, int(q[r][c]))
+            await bus.write(0x4000 + r, int(eq[r]))
+        for base, mat in ((0x1000, k), (0x2000, v)):
+            for t in range(mat.shape[0]):
+                for b, byte in enumerate(rm.pack_fp4(mat[t])):
+                    await bus.write(base + 8 * t + b, byte)
+        for base, ex in ((0x4100, ek), (0x4200, ev)):
+            for t in range(len(ex)):
+                await bus.write(base + t, int(ex[t]))
+
+    qf, kf, vf = rm.random_case(rng, n=N, d=D, scale=1.5)
+    args = rm.prepare_kvfp4(qf, kf, vf)
+    a4 = rm.prepare_kv4(qf, kf, vf)
+    await load_kvf(*args)
+    ref = rm.reference(qf, kf, vf)
+    for fused, causal in ((False, False), (True, False), (True, True)):
+        exp = rm.attention(*args, fused=fused, mode=rm.MODE_EXACT, causal=causal)
+        o, eo, cycles, skips = await run_pass(bus, fused, rm.MODE_EXACT, causal=causal)
+        tag = f"fp4 full fused={int(fused)} causal={int(causal)}"
+        assert np.array_equal(o, exp.o) and np.array_equal(eo, exp.eo), f"{tag}: mismatch"
+        assert skips == exp.skips
+        if not causal:
+            got = rm.mx_dequantize(o, eo)
+            e4 = rm.attention(*a4, fused=fused, mode=rm.MODE_EXACT)
+            g4 = rm.mx_dequantize(e4.o, e4.eo)
+            cos = float(np.sum(got * ref) / np.linalg.norm(got) / np.linalg.norm(ref))
+            cos4 = float(np.sum(g4 * ref) / np.linalg.norm(g4) / np.linalg.norm(ref))
+            summary.append(f"{tag:34s} cycles={cycles:4d} cos FP4={cos:.5f} (INT4, model={cos4:.5f})")
+            dut._log.info(summary[-1])
+    # a 2N-token KV cache
+    T = 2 * N
+    for name, kw in CASES:
+        qf, kf, vf = rm.random_case(rng, n=T, d=D, **kw)
+        q, eq, k, ek, v, ev = rm.prepare_kvfp4(qf, kf, vf)
+        _, _, k4, ek4, v4, ev4 = rm.prepare_kv4(qf, kf, vf)
+        q8, eq8, k8, ek8, v8, ev8 = rm.prepare(qf, kf, vf)
+        ref = rm.reference_causal(qf, kf, vf)
+        cf, c4, c8 = [], [], []
+        mq = np.zeros((N, D), dtype=np.int64)
+        meq = np.zeros(N, dtype=np.int64)
+        for t in range(T):
+            row = t % N
+            mq[row], meq[row] = q[t], eq[t]
+            for c in range(D):
+                await bus.write(0x0000 + row * D + c, int(q[t][c]))
+            await bus.write(0x4000 + row, int(eq[t]))
+            for base, mat in ((0x1000, k), (0x2000, v)):
+                for b, byte in enumerate(rm.pack_fp4(mat[t])):
+                    await bus.write(base + 8 * t + b, byte)
+            await bus.write(0x4100 + t, int(ek[t]))
+            await bus.write(0x4200 + t, int(ev[t]))
+            await bus.write(0x5010, t + 1)
+            await bus.write(0x5011, row)
+            await bus.write(0x5000, 1 | (1 << 4))
+            await wait_done(dut)
+            o, eo, cycles, _ = await read_out(bus, rows=[row])
+            exp = rm.attention_decode(mq, meq, k, ek, v, ev, qrow=row, length=t + 1)
+            assert np.array_equal(o[row], exp.o[0]), f"{name} t={t}: rtl={o[row]} model={exp.o[0]}"
+            assert eo[row] == exp.eo[0]
+            cf.append(_cos(rm.mx_dequantize(o[row:row + 1], eo[row:row + 1])[0], ref[t]))
+            for kk, ekk, vv, evv, lst in ((k4, ek4, v4, ev4, c4), (k8, ek8, v8, ev8, c8)):
+                e = rm.attention_decode(q8, eq8, kk, ekk, vv, evv, qrow=t, length=t + 1)
+                lst.append(_cos(rm.mx_dequantize(e.o, e.eo)[0], ref[t]))
+        summary.append(f"fp4 decode {name:8s} tokens={T} cycles@len{T}={cycles:3d} mean cos FP4={np.mean(cf):.5f} "
+                       f"(model: INT4={np.mean(c4):.5f}, INT8={np.mean(c8):.5f}) min FP4={np.min(cf):.5f} INT4={np.min(c4):.5f}")
+        dut._log.info(summary[-1])
+    # K in MXINT8, V in MXFP4 (KVFMT = 0b1010)
+    qf, kf, vf = rm.random_case(rng, n=N, d=D, scale=2.5)
+    q, eq, k, ek, _, _ = rm.prepare(qf, kf, vf)
+    _, _, _, _, v, ev = rm.prepare_kvfp4(qf, kf, vf)
+    await bus.write(0x5012, 0xA)
+    for r in range(N):
+        for c in range(D):
+            await bus.write(0x0000 + r * D + c, int(q[r][c]))
+            await bus.write(0x1000 + r * D + c, int(k[r][c]))
+        for b, byte in enumerate(rm.pack_fp4(v[r])):
+            await bus.write(0x2000 + 8 * r + b, byte)
+        for base, ex in ((0x4000, eq), (0x4100, ek), (0x4200, ev)):
+            await bus.write(base + r, int(ex[r]))
+    for mode in (rm.MODE_EXACT, rm.MODE_MF2):
+        exp = rm.attention(q, eq, k, ek, v, ev, fused=True, mode=mode, causal=True)
+        o, eo, _, _ = await run_pass(bus, True, mode, causal=True)
+        assert np.array_equal(o, exp.o) and np.array_equal(eo, exp.eo), f"K8/V-FP4 mode {mode} mismatch"
+    # mixed paging: INT8 sink page and last page, the rest MXFP4 (KVFMT bits 2, 3)
+    await bus.write(0x5012, 0xC)
+    T, NP, int8 = 24, 6, {0, 5}
+    qf, kf, vf = rm.random_case(rng, n=T, d=D, scale=1.5)
+    q, eq, k8, ek8, v8, ev8 = rm.prepare(qf, kf, vf)
+    _, _, kp, ekp, vp, evp = rm.prepare_kvfp4(qf, kf, vf)
+    ptab, nxt = [0] * (2 * N // 4), 0
+    for pg in sorted(int8):
+        ptab[pg], nxt = nxt, nxt + 2
+    for pg in range(NP):
+        if pg not in int8:
+            ptab[pg], nxt = nxt, nxt + 1
+    await write_ptab(bus, ptab)
+    await bus.write(0x501B, sum(1 << pg for pg in range(NP) if pg not in int8))
+    await bus.write(0x501A, 3)
+    pick = lambda a8, af: np.array([a8[t] if t // 4 in int8 else af[t] for t in range(T)])
+    km, ekm, vm, evm = pick(k8, kp), pick(ek8, ekp), pick(v8, vp), pick(ev8, evp)
+    for t in range(T):
+        pg, i = t // 4, t % 4
+        slot = ptab[pg] * 4 + (i if pg not in int8 else 2 * i)
+        for base, mat in ((0x1000, km), (0x2000, vm)):
+            data = rm.pack_fp4(mat[t]) if pg not in int8 else [int(x) for x in mat[t]]
+            for b, byte in enumerate(data):
+                await bus.write(base + 8 * slot + b, int(byte) & 0xFF)
+        await bus.write(0x4100 + slot, int(ekm[t]))
+        await bus.write(0x4200 + slot, int(evm[t]))
+        qr = t % N
+        for c in range(D):
+            await bus.write(qr * D + c, int(q[t][c]))
+        await bus.write(0x4000 + qr, int(eq[t]))
+        await bus.write(0x5010, t + 1)
+        await bus.write(0x5011, qr)
+        await bus.write(0x5000, 1 | (1 << 4))
+        await wait_done(dut)
+        o, eo, _, _ = await read_out(bus, rows=[qr])
+        exp = rm.attention_decode(q[:t + 1], eq[:t + 1], km[:t + 1], ekm[:t + 1], vm[:t + 1], evm[:t + 1],
+                                  qrow=t, length=t + 1)
+        assert np.array_equal(o[qr], exp.o[0]) and eo[qr] == exp.eo[0], f"mixed FP4 t={t} mismatch"
+    summary.append(f"fp4 mixed paging (INT8 pages 0 and 5, FP4 pages 1-4): {T} decode steps bit-exact")
+    await bus.write(0x501A, 0)
+    await bus.write(0x501B, 0)
+    await write_ptab(bus, list(range(2 * N // 4)))
+    await bus.write(0x5012, 0)
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", f"fp4_kv_N{N}_D{D}.txt"), "w") as f:
+        f.write(chr(10).join(summary) + chr(10))
+
+
 @cocotb.test()
 async def test_key_skip(dut):
     """Hardware key skip (SKIPTHR, 0x5013): keys scoring SKIPTHR or more powers

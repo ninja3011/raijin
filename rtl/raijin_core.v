@@ -65,6 +65,10 @@
 //                  8t of its region, element 2b in the low nibble of byte b), so
 //                  with both bits set the cache holds 2N tokens. Each nibble
 //                  enters the INT8 datapath as x4 << 4.
+//                  bit2: 4-bit K nibbles are MXFP4 (E2M1: s e1 e0 m) instead of
+//                  INT4, bit3: the same for V. Both apply to every 4-bit token,
+//                  in KVFMT and mixed (PFMT) modes. An E2M1 nibble enters the
+//                  datapath as +-(2|x|) << 3 = 16 x, 2|x| in {0,1,2,3,4,6,8,12}.
 //   0x5013  SKIPTHR key-skip threshold (0 = off): keys scoring SKIPTHR or more
 //                  powers of two below the running max are dropped (p = 0)
 //   0x5014..7 VSKIPS (little endian) V-row reads saved this pass: no lane
@@ -166,6 +170,7 @@ module raijin_core #(
     reg signed [7:0]  offset;
     reg [LK:0]        len;
     reg               k4, v4;         // KVFMT: MXINT4 K (bit 0), V (bit 1)
+    reg               kfp, vfp;       // KVFMT: 4-bit K (bit 2), V (bit 3) is MXFP4
     reg  [3:0]        thr;            // SKIPTHR
     reg  [31:0]       vskips;         // V reads saved
     reg               rope_en, rope_abs;  // ROPE
@@ -378,17 +383,34 @@ module raijin_core #(
     wire          k4_d2 = mx_on ? jd2_is4 : k4;
 
     // MXINT4 K/V: pick token t's half of the SRAM word and widen each nibble
-    // to INT8 as x4 << 4 (the host's e_k / e_v account for the 4-bit shift)
+    // to INT8 as x4 << 4 (the host's e_k / e_v account for the 4-bit shift).
+    // MXFP4 (fp = 1): the nibble is E2M1 and widens to +-(2|x|) << 3, the same
+    // 16 x scale, so the rest of the datapath is shared.
+    function [7:0] fp4to8;
+        input [3:0] n;
+        reg   [7:0] mag;
+        begin
+            case (n[2:0])
+                3'd0: mag = 8'd0;   3'd1: mag = 8'd8;
+                3'd2: mag = 8'd16;  3'd3: mag = 8'd24;
+                3'd4: mag = 8'd32;  3'd5: mag = 8'd48;
+                3'd6: mag = 8'd64;  default: mag = 8'd96;
+            endcase
+            fp4to8 = n[3] ? (~mag + 8'd1) : mag;
+        end
+    endfunction
     function [D*8-1:0] unpack4;
         input [NB*32-1:0] w;
         input             hi;
+        input             fp;
         integer c;
         begin
             for (c = 0; c < D; c = c + 1)
-                unpack4[c*8 +: 8] = {w[(hi ? 64 : 0) + c*4 +: 4], 4'd0};
+                unpack4[c*8 +: 8] = fp ? fp4to8(w[(hi ? 64 : 0) + c*4 +: 4])
+                                       : {w[(hi ? 64 : 0) + c*4 +: 4], 4'd0};
         end
     endfunction
-    wire [D*8-1:0] k_row = k4_d2 ? unpack4(d1_r, pj_d2[0]) : d1_r;
+    wire [D*8-1:0] k_row = k4_d2 ? unpack4(d1_r, pj_d2[0], kfp) : d1_r;
 
     integer qi;
     always @(posedge clk) begin
@@ -638,7 +660,7 @@ module raijin_core #(
     wire [P*D*24-1:0] acc;
     raijin_acc_array #(.R(P), .D(D)) u_acc (
         .clk(clk), .rst_n(rst_n), .clear(acc_clear), .mf(mf),
-        .v(av42 ? unpack4(d0_r, aj2[0]) : d0_r), .dv(dvr[aj2]),
+        .v(av42 ? unpack4(d0_r, aj2[0], vfp) : d0_r), .dv(dvr[aj2]),
         .en(aen2), .first(af2), .p(ap2), .sa(asa2), .sb(asb2), .delta(ad2),
         .acc(acc)
     );
@@ -858,7 +880,7 @@ module raijin_core #(
                               5'h0F: rd_reg <= VERSION;
                               5'h10: rd_reg <= len;
                               5'h11: rd_reg <= qrow;
-                              5'h12: rd_reg <= {6'd0, v4, k4};
+                              5'h12: rd_reg <= {4'd0, vfp, kfp, v4, k4};
                               5'h13: rd_reg <= {4'd0, thr};
                               5'h14: rd_reg <= vskips[7:0];
                               5'h15: rd_reg <= vskips[15:8];
@@ -915,6 +937,8 @@ module raijin_core #(
             len    <= N;
             k4     <= 1'b0;
             v4     <= 1'b0;
+            kfp    <= 1'b0;
+            vfp    <= 1'b0;
             thr    <= 4'd0;
             vskips <= 32'd0;
             rope_en  <= 1'b0;
@@ -957,8 +981,10 @@ module raijin_core #(
                     ptab[{cidx[1:0], 1'b1}] <= wdata_r[4 +: LK-LPG];
                 end
                 if (cidx == 5'h12) begin
-                    k4 <= wdata_r[0];
-                    v4 <= wdata_r[1];
+                    k4  <= wdata_r[0];
+                    v4  <= wdata_r[1];
+                    kfp <= wdata_r[2];
+                    vfp <= wdata_r[3];
                 end
                 if (cidx == 5'h11) qrow   <= wdata_r[LN-1:0];
             end

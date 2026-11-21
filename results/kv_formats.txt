@@ -1,0 +1,12 @@
+KV element formats: 32-token causal decode, d=16, mean cosine vs FP32 over 16 cases per family
+relative RMS quantisation error of K and V rows: INT8 0.0072, INT4 0.1284, FP4 0.1088
+K     V     bits/token    random     sharp  outliers
+INT8  INT8         272   0.99985   0.99964   0.99952
+INT8  INT4         208   0.99202   0.99142   0.99144
+INT8  FP4          208   0.99444   0.99433   0.99393
+INT4  INT8         208   0.99468   0.96713   0.98099
+INT4  INT4         144   0.98667   0.95942   0.97308
+INT4  FP4          144   0.98932   0.96230   0.97536
+FP4   INT8         208   0.99577   0.96890   0.98118
+FP4   INT4         144   0.98763   0.96123   0.97341
+FP4   FP4          144   0.99057   0.96351   0.97528

@@ -405,6 +405,67 @@ def pack4(row8: Sequence[int]) -> List[int]:
     return [n[2 * b] | (n[2 * b + 1] << 4) for b in range(len(n) // 2)]
 
 
+# MXFP4 (OCP MX, E2M1 elements): nibble s e1 e0 m. Twice the value is an
+# integer, 2|x| in {0, 1, 2, 3, 4, 6, 8, 12}, so the chip widens a nibble to
+# INT8 as +-(2|x|) << 3 = 16 x, the same scale as an MXINT4 element x4 << 4.
+FP4_MAG2 = (0, 1, 2, 3, 4, 6, 8, 12)          # 2|x| for codes 0..7
+FP4_GRID = np.array(sorted({s * m / 2 for m in FP4_MAG2 for s in (1, -1)}))
+
+
+def fp4_code8(nib: int) -> int:
+    """INT8 element the datapath sees for one E2M1 nibble (16 x)."""
+    mag = FP4_MAG2[nib & 7] << 3
+    return -mag if nib & 8 else mag
+
+
+def mx_quantize_fp4(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Quantise each row to MXFP4: E2M1 elements (|x| <= 6) and one shared E8M0
+    exponent per row. The host tries the exponent at which the row maximum just
+    fits (|x| <= 6) and the one below it (the maximum then clips to 6, the
+    other elements get a finer grid) and keeps the one with the lower squared
+    error; the chip only sees the exponent, so this choice is free.
+    Elements are returned as the INT8 datapath sees them (16 x), with the
+    exponents; a value is then 16 x / 64 * 2^(e - bias), as for MXINT4."""
+    x = np.asarray(x, dtype=np.float64)
+    q = np.zeros(x.shape, dtype=np.int64)
+    e = np.zeros(x.shape[0], dtype=np.int64)
+    for i, row in enumerate(x):
+        amax = float(np.max(np.abs(row)))
+        ex0 = 0 if amax == 0 else int(np.ceil(np.log2(amax * 4 / 6)))
+        best = None
+        for ex in (ex0, ex0 - 1):            # host picks the lower-error exponent
+            ex = min(max(ex, -127), 128)
+            y = row / 2.0 ** ex * 4
+            g = FP4_GRID[np.abs(y[:, None] - FP4_GRID[None, :]).argmin(axis=1)]
+            err = float(np.sum((g / 4 * 2.0 ** ex - row) ** 2))
+            if best is None or err < best[0]:
+                best = (err, g, ex)
+        q[i] = np.round(best[1] * 16).astype(np.int64)
+        e[i] = best[2] + EXP_BIAS
+    return q, e
+
+
+def fp4_nibble(c8: int) -> int:
+    """E2M1 nibble of an INT8 element 16 x (inverse of fp4_code8)."""
+    mag = FP4_MAG2.index(abs(int(c8)) >> 3)
+    return mag | (8 if c8 < 0 else 0)
+
+
+def pack_fp4(row8: Sequence[int]) -> List[int]:
+    """Pack one MXFP4 row (given as 16 x) into 8 bytes, as pack4."""
+    n = [fp4_nibble(x) for x in row8]
+    return [n[2 * b] | (n[2 * b + 1] << 4) for b in range(len(n) // 2)]
+
+
+def prepare_kvfp4(qf, kf, vf):
+    """Like prepare(), but K and V in MXFP4 (returned as 16 x)."""
+    d = qf.shape[1]
+    q, eq = mx_quantize(qf * (np.log2(np.e) / np.sqrt(d)))
+    k, ek = mx_quantize_fp4(kf)
+    v, ev = mx_quantize_fp4(vf)
+    return q, eq, k, ek, v, ev
+
+
 def prepare_kv4(qf, kf, vf):
     """Like prepare(), but K and V in MXINT4 (returned as x4 << 4)."""
     d = qf.shape[1]
