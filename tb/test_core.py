@@ -295,3 +295,46 @@ async def test_multi_query_decode(dut):
                         dut._log.info(summary[-1])
     with open(os.path.join(os.path.dirname(__file__), "..", "results", f"multi_decode_N{N}_D{D}.txt"), "w") as f:
         f.write(chr(10).join(summary) + chr(10))
+
+
+@cocotb.test()
+async def test_streaming_kv_cache(dut):
+    """StreamingLLM-style generation past the cache size: 4 attention-sink rows
+    stay pinned and the other N - 4 rows are a ring of the most recent tokens.
+    Attention is order-free over keys, so the decode step needs no change; the
+    host only picks the row to overwrite. 3N tokens, each step bit-exact."""
+    bus = await setup(dut)
+    rng = np.random.default_rng(int(os.environ.get("RAIJIN_SEED", 7)) + 31)
+    sinks, total = 4, 3 * N
+    qf, kf, vf = rm.random_case(rng, n=total, d=D, scale=1.5)
+    q, eq, k, ek, v, ev = rm.prepare(qf, kf, vf)
+    ref = rm.reference_streaming(qf, kf, vf, N, sinks)
+    # mirror of the on-chip cache contents, for the bit-exact model
+    mq, mk, mv = (np.zeros((N, D), dtype=np.int64) for _ in range(3))
+    meq, mek, mev = (np.zeros(N, dtype=np.int64) for _ in range(3))
+    coss = []
+    for t in range(total):
+        slot = rm.streaming_slot(t, N, sinks)
+        for base, mat, mir in ((0x0000, q, mq), (0x1000, k, mk), (0x2000, v, mv)):
+            mir[slot] = mat[t]
+            for c in range(D):
+                await bus.write(base + slot * D + c, int(mat[t][c]))
+        for base, ex, mir in ((0x4000, eq, meq), (0x4100, ek, mek), (0x4200, ev, mev)):
+            mir[slot] = ex[t]
+            await bus.write(base + slot, int(ex[t]))
+        length = min(t + 1, N)
+        await bus.write(0x5010, length)
+        await bus.write(0x5011, slot)
+        await bus.write(0x5000, 1 | (1 << 4))
+        await wait_done(dut)
+        o, eo, cycles, skips = await read_out(bus, rows=[slot])
+        exp = rm.attention_decode(mq, meq, mk, mek, mv, mev, qrow=slot, length=length)
+        assert np.array_equal(o[slot], exp.o[0]), f"t={t} slot={slot}: rtl={o[slot]} model={exp.o[0]}"
+        assert eo[slot] == exp.eo[0], f"t={t}: e rtl={eo[slot]} model={exp.eo[0]}"
+        got = rm.mx_dequantize(o[slot:slot + 1], eo[slot:slot + 1])[0]
+        coss.append(float(np.dot(got, ref[t]) / np.linalg.norm(got) / np.linalg.norm(ref[t])))
+    line = (f"streaming N={N} sinks={sinks} tokens={total}: mean cos={np.mean(coss):.5f} "
+            f"min cos={np.min(coss):.5f} (tokens past the cache: mean {np.mean(coss[N:]):.5f})")
+    dut._log.info(line)
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", f"streaming_N{N}_D{D}.txt"), "w") as f:
+        f.write(line + chr(10))

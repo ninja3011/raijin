@@ -270,6 +270,28 @@ def _check_decode_matches_fused(rng) -> None:
         assert np.array_equal(r.o[0], full.o[i]) and r.eo[0] == full.eo[i], i
 
 
+def streaming_slot(t: int, n: int, sinks: int) -> int:
+    """KV-cache row for token t in a StreamingLLM-style cache of n rows: the
+    first `sinks` tokens stay pinned (attention sinks), and the other n - sinks
+    rows form a ring that always holds the most recent tokens."""
+    if t < n:
+        return t
+    return sinks + (t - sinks) % (n - sinks)
+
+
+def reference_streaming(qf, kf, vf, n: int, sinks: int):
+    """FP32 attention for every token t over the keys a streaming cache of n
+    rows holds at step t: tokens 0..sinks-1 plus the last n - sinks tokens."""
+    out = []
+    for t in range(qf.shape[0]):
+        keys = list(range(t + 1)) if t < n else \
+            list(range(sinks)) + list(range(t - (n - sinks) + 1, t + 1))
+        s = qf[t] @ kf[keys].T / np.sqrt(qf.shape[1])
+        p = np.exp(s - s.max())
+        out.append((p / p.sum()) @ vf[keys])
+    return np.array(out)
+
+
 # ---------------------------------------------------------------------------
 # Quantisation helpers (host side)
 # ---------------------------------------------------------------------------

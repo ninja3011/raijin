@@ -58,6 +58,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 | 2 | Group pipelining in the fused dataflow | RTL merged | Fused pass 357 → **173** cycles at P = 2 (2.06×, 74% utilization) and 197 → **111** at P = 4 (1.77×). That is 3.9 GOPS at 42 MHz, or 4.7 GOPS at 50 MHz. Unfused and decode are unchanged |
 | 3 | Causal prefill (CTRL bit 5) | RTL merged | One causal fused pass: **153** cycles at P = 2 and **97** at P = 4. Building the same outputs from 16 decode steps takes about 650 cycles at P = 2 and 680 at P = 4, so prefill is 4.2× to 7× faster, before counting the host traffic each decode step needs |
 | 4 | Multi-query decode: GQA/MQA and speculative verify (CTRL bits 6, 7) | RTL merged | One step serves P query rows at LEN = 16: **49** cycles for 2 rows at P = 2, against 96 for 2 single steps (1.96×), and **53** cycles for 4 rows at P = 4, against 200 (3.77×). Decode throughput per cycle scales with P |
+| 7 | Streaming KV cache with attention sinks (StreamingLLM) | Test and host policy, no RTL change | Generation runs past the 16-row cache. Over 48 tokens with 4 sinks, every step is bit-exact; mean cosine vs FP32 is 0.99983 overall and 0.99979 for tokens past the cache size |
 
 ### 1. Timing closure
 
@@ -164,3 +165,33 @@ cached V rows for every row, as in a single-row step, so row r of a GQA step
 is bit-identical to a single-row step on that row. `test_multi_query_decode`
 covers GQA and speculative verify, three tensor families, LEN ∈ {P, N/2, N}
 and the first and last groups, all bit-exact.
+
+### 7. Streaming KV cache with attention sinks
+
+Without this, a KV cache of N rows stops generation at N tokens.
+StreamingLLM (Xiao et al., 2023) showed that keeping the first few tokens
+(the "attention sinks") plus a window of the most recent tokens lets a model
+generate indefinitely with fixed memory.
+
+On Raijin this needs no new hardware. Attention does not depend on the order
+of its keys (positions are already folded into Q and K by RoPE on the host).
+The online softmax takes any key order, and decode mode takes any LEN and
+QROW. The host's cache policy is `rm.streaming_slot(t, N, sinks)`: rows
+0..sinks−1 stay pinned, and token t ≥ N overwrites row
+sinks + (t − sinks) mod (N − sinks). Each decode step then attends over
+LEN = N rows.
+
+`test_streaming_kv_cache` generates 3N = 48 tokens with 4 sinks through the
+real decode path. Every step is bit-exact with the model run on the mirrored
+cache contents. The FP32 reference `reference_streaming` uses the same
+sink-plus-window key set (`results/streaming_N16_D16.txt`):
+
+| Tokens | Mean cosine | Min cosine |
+| --- | --- | --- |
+| All 48 | 0.99983 | 0.99900 |
+| The 32 past the cache size | 0.99979 | — |
+
+To be clear about the claim: this is a host-side policy that Raijin's
+order-free dataflow supports at no cost. It is not a hardware block. The
+hardware part of the claim is that a decode step costs the same whichever
+rows are live.

@@ -1,0 +1,1 @@
+streaming N=16 sinks=4 tokens=48: mean cos=0.99983 min cos=0.99900 (tokens past the cache: mean 0.99979)
