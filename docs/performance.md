@@ -63,6 +63,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 | 8 | Hardware key skip and V-read gating (SKIPTHR 0x5013, VSKIPS 0x5014) | RTL merged | Cycles unchanged; this is an energy feature. With the gate alone (SKIPTHR = 0), a fused pass on sharp attention skips 15 of 64 V-row reads (23%), and 10 of 64 (16%) on outlier-heavy data. SKIPTHR = 6 raises that to 25 of 64 (39%) with cosine 0.99984 against 0.99986. Lower thresholds save more but cost accuracy on flat attention |
 | 9 | RoPE on write (ROPE 0x5018, ROPEPOS 0x5019, `rtl/raijin_rope.v`) | RTL merged | No cycle or datapath-timing cost: rows are rotated on their way into SRAM. Bit-exact; mean cosine against FP32 RoPE attention is 0.9989 to 0.9999 across fused, unfused, causal and decode passes, including decode at absolute positions 200 to 215 |
 | 10 | Paged KV cache (PAGED 0x501A, PTAB 0x501C..F) | RTL merged | No cycle cost: the page table sits on the K and V read addresses. Two sequences share one cache and one prompt page, and a 32-token INT4 cache is scattered over a shuffled page order. Every decode step is bit-exact with decode on the gathered logical sequence |
+| 11 | Chip top: SPI host port and idle clock gating (`rtl/raijin_spi.v`, `rtl/raijin_chip.v`) | RTL merged; layout config added, not yet run | The whole register and memory map is reachable through 4 SPI pins. Passes over SPI are bit-exact. During a decode loop with 200-cycle idle gaps between tokens, the core clock is off **90.8%** of the time. SPI bandwidth (0.78 MB/s), not compute, now limits the end-to-end token rate |
 
 ### 1. Timing closure
 
@@ -458,4 +459,90 @@ cells).
 Paging only applies to decode steps. Prefill and full passes read the
 regions in order, and the host can lay those out with the identity table
 (the reset value).
+
+### 11. Chip top: SPI host port and idle clock gating
+
+The core's parallel bus (16 address bits, 8 data bits, we and re) is fine
+inside an FPGA, but a packaged edge chip needs a narrow host port that any
+MCU can drive. `raijin_chip` is the new tapeout top level:
+
+| Pin | Direction | Use |
+| --- | --- | --- |
+| clk, rst_n | in | core clock (50 MHz target), asynchronous reset |
+| sck, cs_n, mosi | in | SPI mode 0 |
+| miso (+ miso_oe) | out | SPI read data, driven only while selected |
+| done | out | pass finished; use it as the host interrupt |
+| busy | out | pass running |
+
+**SPI protocol** (`raijin_spi`). The commands follow SPI SRAM conventions, so
+stock MCU drivers work. The address auto-increments, and every data byte is
+one core bus access:
+
+- `0x02 AH AL d0 d1 ...` writes a burst. One burst loads a whole Q, K or V
+  matrix (256 bytes) or an exponent vector.
+- `0x0B AH AL dummy d0 d1 ...` reads a burst (fast-read style, with one dummy
+  byte). Each byte's core read is issued one byte ahead, so the core's 3-cycle
+  read latency is hidden.
+- SCK, CS_N and MOSI pass through two-flop synchronizers into the core clock
+  domain. That means SCK ≤ f_clk / 8, which is 6.25 MHz at 50 MHz. In return,
+  there is no second clock domain to close timing on.
+
+**Clock gating** (`raijin_chip`). The SPI target runs on the free-running
+clock, and the core runs on a gated clock. The gate opens:
+
+- while a pass runs;
+- for each bus access the SPI target makes, plus HOLD = 7 cycles. That
+  covers the 2-cycle write latency, the 3-cycle read latency and the done
+  flag settling.
+
+Under `RAIJIN_SKY130_CELLS` the gate is a sky130 integrated clock gate
+(`sky130_fd_sc_hd__dlclkp_1`); otherwise it is a behavioural latch-and-AND.
+An SPI byte is 64 clocks at f_clk / 8, so even while the host is streaming
+data the core clock runs only about 8 of every 64 cycles. Between tokens,
+while the MCU runs the rest of the model, it stops completely. The datapath
+flops and their clock tree (most of the 37 mW measured on `sram_p2_v2`) see
+no edges in that time. `gated_cycles` is a debug counter of cycles with the
+core clock off.
+
+**Verification** (`tb/test_chip.py`, `python3 tb/run_tests.py chip`). A
+cocotb SPI master at 6.25 MHz drives the chip pins only.
+- `test_spi_registers` covers the ID registers, a register round trip, and a
+  burst write and read of an exponent vector.
+- `test_spi_passes` loads Q, K, V and the exponents in six bursts, then runs
+  fused, causal and unfused passes and reads O back in bursts. It then runs a
+  16-token KV-cache decode loop, with one row per tensor written per token and
+  a 200-cycle idle gap after each token.
+- Everything is bit-exact with the model, at P = 2 and P = 4.
+
+**Measured** (P = 4, `results/chip_spi_N16_D16.txt`):
+
+| Quantity | Value |
+| --- | --- |
+| Full Q/K/V + exponent load | 834 bytes, 1.07 ms at 6.25 MHz SCK |
+| Fused pass | 111 cycles, 2.2 µs at 50 MHz |
+| Decode step, SPI traffic per token | 103 bytes (one Q, K and V row, three exponents, LEN/QROW, CTRL, one O row and its exponent, with command overhead) |
+| Decode loop, 16 tokens | core clock gated for 90.8% of all cycles |
+
+**What this shows, honestly.** With a single-lane SPI host, the chip
+computes a full pass in about 2 µs but needs about 1 ms to receive its
+operands. So end-to-end throughput for full passes is host-bound by a factor
+of about 500. In decode, about 103 bytes per token take about 130 µs, which
+caps the rate at about 7,500 tokens per second per head. That's still far
+above what a small MCU can feed through the rest of the model. This is why
+the on-chip KV cache (features 6, 7 and 10), on-chip RoPE (feature 9) and
+multi-query decode (feature 4) matter. Each one cuts the bytes the host must
+send per token. The next steps that follow from it:
+
+- **QSPI** (4 data lines, same protocol with quad phases) gives 4× the host
+  bandwidth for 3 more pins.
+- **A faster SCK** with a real SPI clock domain and CDC FIFOs would remove the
+  f_clk / 8 limit.
+- **Output-only readback**, which reads just e_o and the rows that changed, is
+  already possible with the burst reads.
+
+**Layout.** `openlane/config_chip_p2.json` hardens `raijin_chip` at P = 2 with
+the same floorplan as `sram_p2_v2`. The macro instances are renamed to
+`u_core.sram*`. It has not been run yet. The gated clock goes through the
+ICG, so CTS has to treat `u_icg/GCLK` as the core's clock root; that run will
+show whether it does.
 

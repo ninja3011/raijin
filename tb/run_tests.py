@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build and run every cocotb test with Icarus Verilog.
 
-Usage: python3 tb/run_tests.py [blocks|core|all] [--sim icarus|verilator]
+Usage: python3 tb/run_tests.py [blocks|core|uart|chip|all] [--sim icarus|verilator]
 Run it inside the tools container: scripts/dock.sh python3 tb/run_tests.py
 """
 import argparse
@@ -15,7 +15,8 @@ ROOT = Path(__file__).resolve().parent.parent
 RTL = ROOT / "rtl"
 SOURCES = [RTL / f for f in (
     "raijin_dpu.v", "raijin_requant.v", "raijin_exp2.v", "raijin_softmax_lane.v",
-    "raijin_acc_array.v", "raijin_dupreg.v", "raijin_rope.v", "raijin_out.v", "raijin_mem.v", "raijin_core.v")]
+    "raijin_acc_array.v", "raijin_dupreg.v", "raijin_rope.v", "raijin_out.v", "raijin_mem.v", "raijin_core.v",
+    "raijin_spi.v", "raijin_chip.v")]
 
 BLOCKS = ["raijin_exp2", "raijin_requant", "raijin_dpu", "raijin_out", "raijin_softmax_lane", "raijin_rope"]
 
@@ -61,7 +62,7 @@ def run(top, module, sim, params=None, extra_env=None, macro=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("what", nargs="?", default="all", choices=["blocks", "core", "uart", "all"])
+    ap.add_argument("what", nargs="?", default="all", choices=["blocks", "core", "uart", "chip", "all"])
     ap.add_argument("--sim", default="icarus")
     ap.add_argument("--n", type=int, default=16)
     ap.add_argument("--p", type=int, default=4, help="DPUs / softmax lanes")
@@ -77,6 +78,9 @@ def main():
             extra_env={"RAIJIN_N": str(args.n), "RAIJIN_D": "16", "RAIJIN_P": str(args.p)}, macro=args.macro)
     if args.what in ("uart", "all"):
         run("raijin_uart_tb_top", "test_uart", args.sim)
+    if args.what in ("chip", "all"):
+        run("raijin_chip", "test_chip", args.sim, params={"N": args.n, "D": 16, "P": args.p},
+            extra_env={"RAIJIN_N": str(args.n), "RAIJIN_D": "16", "RAIJIN_P": str(args.p)})
 
 
 if __name__ == "__main__":

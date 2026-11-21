@@ -18,6 +18,17 @@ query row attends to the LEN keys and values already held in SRAM.
 Q, K, V, O and the score buffer live in four 1 KB sky130 SRAM macros
 (`docs/sram_kv.md`).
 
+For LLM inference the core adds:
+- multi-query and speculative decode;
+- an MXINT4, paged KV cache;
+- attention sinks;
+- RoPE applied as rows are written;
+- hardware key skip.
+
+The tapeout top level, `rtl/raijin_chip.v`, wraps the core with an SPI host
+port and idle clock gating. `docs/performance.md` documents each feature,
+with measurements.
+
 The softmax-to-V path has an exact mode (16-entry LUT, 9×8 multipliers) and two
 multiplier-free modes where each probability is one or two powers of two, so
 P·V becomes shifts and adds. Every RTL block is bit-exact with the Python golden
@@ -33,8 +44,8 @@ A7-100T through Vivado.
 | `model/raijin_model.py` | Bit-exact golden model, quantisation helpers, FP32 reference |
 | `model/accuracy.py` | Accuracy study of every numeric variant against FP32 |
 | `rtl/` | Core RTL (Verilog-2005); `raijin_mem.v` models the SRAM macro |
-| `tb/` | cocotb tests (block level and full pass) |
-| `openlane/` | OpenLane 2 configs; `config_sram_p2.json` is the SRAM build, `macros/` its macro views |
+| `tb/` | cocotb tests (block level, full pass, and chip level over SPI) |
+| `openlane/` | OpenLane 2 configs: `config_sram_p2.json` is the SRAM core build, `config_chip_p2.json` the chip top (SPI and clock gate), and `macros/` holds the macro views |
 | `fpga/` | Arty A7-100T top, UART bridge, constraints, Vivado scripts, host script |
 | `docs/` | Numerics and architecture notes |
 | `scripts/dock.sh` | Runs any command inside the `hpretl/iic-osic-tools` container |
