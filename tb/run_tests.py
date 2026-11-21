@@ -43,11 +43,11 @@ def run(top, module, sim, params=None, extra_env=None, macro=False):
     sources = SOURCES + (FPGA_SOURCES if top == "raijin_uart_tb_top" else [])
     build_dir = ROOT / "sim_build" / f"{top}_{sim}{'_macro' if macro else ''}"
     build_args = ["-Wall"] if sim == "icarus" else ["-Wno-fatal", "-Wno-WIDTH"]
-    defines = {}
+    defines = {"RAIJIN_TRACE": 1} if os.environ.get("RAIJIN_TRACE") else {}
     if macro:
         # simulate against the real OpenRAM macro model instead of rtl/raijin_mem.v
         sources = [s for s in sources if s.name != "raijin_mem.v"] + [macro_model(build_dir)]
-        defines = {"RAIJIN_SKY130_SRAM": 1}
+        defines = dict(defines, RAIJIN_SKY130_SRAM=1)
     runner.build(sources=sources, hdl_toplevel=top, build_dir=build_dir, defines=defines,
                  parameters=params or {}, always=True, build_args=build_args, waves=False,
                  timescale=("1ns", "1ps"))

@@ -146,7 +146,7 @@ async def test_lane_online_and_recip(dut):
     """Drive one lane in online mode and compare m, l and 1/l with the model."""
     cocotb.start_soon(Clock(dut.clk, 20, unit="ns").start())
     dut.rst_n.value = 0
-    for sig in (dut.clear, dut.s_valid, dut.m_update, dut.emit, dut.recip_start):
+    for sig in (dut.clear, dut.s_valid, dut.m_update, dut.emit, dut.recip_start, dut.first, dut.last):
         sig.value = 0
     dut.mode.value = 0
     dut.tag.value = 0

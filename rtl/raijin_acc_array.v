@@ -8,6 +8,8 @@
 // the same value because p = 2^(8-sa) + 2^(8-sb) there.
 // A row whose en is low keeps its value (underflow skip, delta is 0 then).
 // The product is registered, so an update lands two edges after its inputs.
+// first (group pipelining) restarts every row at this update instead of
+// accumulating into the previous group's values, so no clear cycle is needed.
 `default_nettype none
 module raijin_acc_array #(
     parameter R = 4,
@@ -20,6 +22,7 @@ module raijin_acc_array #(
     input  wire [D*8-1:0]    v,
     input  wire [4:0]        dv,
     input  wire [R-1:0]      en,
+    input  wire              first,
     input  wire [R*9-1:0]    p,
     input  wire [R*4-1:0]    sa,
     input  wire [R*4-1:0]    sb,
@@ -34,11 +37,14 @@ module raijin_acc_array #(
             wire [3:0] sbr = sb[gr*4 +: 4];
             wire [4:0] dr  = delta[gr*5 +: 5];
             reg  [4:0] dr_r;
-            reg        en_r;
+            reg        en_r, first_r;
             always @(posedge clk) dr_r <= dr;
             always @(posedge clk or negedge rst_n)
-                if (!rst_n) en_r <= 1'b0;
-                else        en_r <= en[gr] && !clear;
+                if (!rst_n) begin en_r <= 1'b0; first_r <= 1'b0; end
+                else begin
+                    en_r    <= en[gr] && !clear;
+                    first_r <= first && !clear;
+                end
             for (gc = 0; gc < D; gc = gc + 1) begin : g_lane
                 wire signed [7:0]  vc = v[gc*8 +: 8];
                 // exact: 9x8 multiply
@@ -56,6 +62,7 @@ module raijin_acc_array #(
                 always @(posedge clk or negedge rst_n) begin
                     if (!rst_n)                a <= 24'sd0;
                     else if (clear)            a <= 24'sd0;
+                    else if (first_r)          a <= en_r ? $signed({{6{t_r[17]}}, t_r}) : 24'sd0;
                     else if (en_r)             a <= (a >>> dr_r) + $signed({{6{t_r[17]}}, t_r});
                 end
                 assign acc[(gr*D + gc)*24 +: 24] = a;

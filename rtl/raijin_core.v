@@ -5,6 +5,13 @@
 //   decode  : KV-cache step. One query row attends to keys 0..LEN-1 already
 //             resident in SRAM (fused dataflow, only that row's group runs)
 //
+// Group pipelining (fused, non-decode): query group g+1 loads and streams its
+// keys right behind group g. The softmax lanes and accumulators restart on the
+// first key of a group (no clear cycle), the final accumulator rows are copied
+// to acc_snap, and the reciprocal, output normalise and O write of group g run
+// while group g+1 streams. O rows queue in a small FIFO and are written on the
+// port-0 cycles that carry no V read.
+//
 // Storage: Q, K, V, O and the score buffer live in four 1 KB SRAM macros
 // (sky130_sram_1kbyte_1rw1r_32x256_8, one RW and one R port each). Bank b holds
 // bytes 4b..4b+3 of every row, so the four banks together return one full
@@ -121,6 +128,7 @@ module raijin_core #(
     assign done = done_r;
     wire mf = (mode != 2'd0);
     wire [LP-1:0] qlane = qrow % P;
+    wire          pipe  = fused && !decode;   // group-pipelined fused pass
 
     // ------------------------------------------------------------------
     // Bus decode
@@ -173,7 +181,8 @@ module raijin_core #(
         F_STREAM   = 5'd16,
         F_DRAIN    = 5'd17,
         S_DONE     = 5'd18,
-        OUT_WAIT   = 5'd19;
+        OUT_WAIT   = 5'd19,
+        P_WAIT     = 5'd20;   // pipelined fused: wait for the last O writes
 
     reg [4:0]    state;
     reg [LG-1:0] g;
@@ -341,6 +350,9 @@ module raijin_core #(
     wire [P*5-1:0]  sm_delta;
     wire [P-1:0]    sm_rvalid;
     wire [P*13-1:0] sm_r;
+    wire [P-1:0]    sm_ofirst, sm_olast;
+    wire            sm_first = pipe && (sm_tag_in[LN-1:0] == {LN{1'b0}});
+    wire            sm_last  = pipe && (sm_tag_in[LN-1:0] == N - 1);
 
     generate
         for (gr = 0; gr < P; gr = gr + 1) begin : g_sm
@@ -351,9 +363,11 @@ module raijin_core #(
                 .clk(clk), .rst_n(rst_n), .clear(sm_clear), .mode(mode),
                 .s_valid(sm_valid), .s(s_in), .tag(sm_tag_in),
                 .m_update(sm_mupd), .emit(sm_emit),
+                .first(sm_first), .last(sm_last),
                 .out_valid(sm_ovalid[gr]), .out_tag(sm_otag[gr*TW +: TW]),
                 .out_p(sm_p[gr*9 +: 9]), .out_sa(sm_sa[gr*4 +: 4]), .out_sb(sm_sb[gr*4 +: 4]),
                 .out_delta(sm_delta[gr*5 +: 5]),
+                .out_first(sm_ofirst[gr]), .out_last(sm_olast[gr]),
                 .m(m_unused), .l(l_unused),
                 .recip_start(rcp_go), .r_valid(sm_rvalid[gr]), .r(sm_r[gr*13 +: 13])
             );
@@ -427,13 +441,23 @@ module raijin_core #(
     reg [P*4-1:0]  asa1, asa2, asb1, asb2;
     reg [P*5-1:0]  ad1, ad2;
     reg [P-1:0]    aen1, aen2, aln1, aln2;
+    // group pipelining: first / last key of a group, and its group index,
+    // carried alongside the accumulate pipeline
+    reg            af1, af2, al1, al2, al3, al4;
+    reg [LG-1:0]   ag1, ag2, ag3, ag4;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             av1 <= 1'b0; av2 <= 1'b0; aen1 <= {P{1'b0}}; aen2 <= {P{1'b0}};
+            {af1, af2, al1, al2, al3, al4} <= 6'd0;
         end else begin
             av1 <= acc_valid; av2 <= av1;
             aen1 <= acc_en;   aen2 <= aen1;
+            af1 <= pipe && sm_ofirst[0];  af2 <= af1;
+            al1 <= pipe && sm_olast[0];   al2 <= al1;  al3 <= al2;  al4 <= al3;
         end
+    end
+    always @(posedge clk) begin
+        ag1 <= sm_otag[LN +: LG];  ag2 <= ag1;  ag3 <= ag2;  ag4 <= ag3;
     end
     always @(posedge clk) begin
         aj1 <= acc_j;      aj2 <= aj1;
@@ -449,7 +473,7 @@ module raijin_core #(
     raijin_acc_array #(.R(P), .D(D)) u_acc (
         .clk(clk), .rst_n(rst_n), .clear(acc_clear), .mf(mf),
         .v(d0_r), .dv(dvr[aj2]),
-        .en(aen2), .p(ap2), .sa(asa2), .sb(asb2), .delta(ad2),
+        .en(aen2), .first(af2), .p(ap2), .sa(asa2), .sb(asb2), .delta(ad2),
         .acc(acc)
     );
 
@@ -467,6 +491,38 @@ module raijin_core #(
     // ------------------------------------------------------------------
     wire              out_issue = (state == OUT_ISSUE);
     wire [LN-1:0]     out_row_i = g * P + orow;
+
+    // pipelined fused pass: the finished group's accumulator rows are copied
+    // the cycle after its last update lands (al4), then issued to the output
+    // stage once that group's reciprocals are ready
+    reg  [P*D*24-1:0] acc_snap;
+    reg  [LG-1:0]     snap_g;
+    reg               pissue;
+    reg  [LP-1:0]     pcnt;
+    reg               rv_q;              // r_valid is a level: use its rising edge
+    always @(posedge clk or negedge rst_n)
+        if (!rst_n) rv_q <= 1'b0;
+        else        rv_q <= sm_rvalid[0];
+    wire              rcp_done = sm_rvalid[0] && !rv_q;
+    always @(posedge clk) begin
+        if (al4) begin
+            acc_snap <= acc;
+            snap_g   <= ag4;
+        end
+    end
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pissue <= 1'b0;
+            pcnt   <= {LP{1'b0}};
+        end else if (pipe && rcp_done) begin
+            pissue <= 1'b1;
+            pcnt   <= {LP{1'b0}};
+        end else if (pissue) begin
+            pcnt <= pcnt + 1'b1;
+            if (pcnt == P - 1) pissue <= 1'b0;
+        end
+    end
+    wire [LN-1:0] pout_row = snap_g * P + pcnt;
     wire              o_valid;
     wire [LN-1:0]     o_tag;
     wire [D*8-1:0]    o_row;
@@ -479,14 +535,15 @@ module raijin_core #(
     // 1/l is held in OUT_RG copies, one per group of output lanes (see raijin_out)
     localparam OUT_RG = 4;
     wire [OUT_RG*13-1:0]  o0_r_bus;
-    raijin_dupreg #(.W(13), .C(OUT_RG)) u_o0r (.clk(clk), .d(rinv[out_row_i]), .q(o0_r_bus));
+    wire [12:0] o0_r_d = pissue ? sm_r[pcnt*13 +: 13] : rinv[out_row_i];
+    raijin_dupreg #(.W(13), .C(OUT_RG)) u_o0r (.clk(clk), .d(o0_r_d), .q(o0_r_bus));
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) o0_v <= 1'b0;
-        else        o0_v <= out_issue;
+        else        o0_v <= out_issue || pissue;
     end
     always @(posedge clk) begin
-        o0_tag <= out_row_i;
-        o0_acc <= acc[orow*D*24 +: D*24];
+        o0_tag <= pissue ? pout_row : out_row_i;
+        o0_acc <= pissue ? acc_snap[pcnt*D*24 +: D*24] : acc[orow*D*24 +: D*24];
     end
     raijin_out #(.D(D), .TW(LN), .RG(OUT_RG)) u_out (
         .clk(clk), .rst_n(rst_n),
@@ -498,6 +555,47 @@ module raijin_core #(
         if (o_valid) eom[o_tag] <= o_e;
     end
 
+    // O write queue (pipelined pass): rows wait for a port-0 cycle with no V read
+    localparam OQ = 2 * P;
+    localparam LQ = $clog2(OQ);
+    reg  [D*8-1:0] oq_row [0:OQ-1];
+    reg  [LN-1:0]  oq_tag [0:OQ-1];
+    reg  [LQ-1:0]  oq_wp, oq_rp;
+    reg  [LQ:0]    oq_n;
+    reg  [LN:0]    owr_cnt;          // O rows written this pass
+    // a row goes straight to the SRAM when the queue is empty and port 0 is free
+    wire           oq_free = pipe && !v_rd;
+    wire           oq_byp  = oq_free && o_valid && (oq_n == 0);
+    wire           oq_deq  = oq_free && (oq_n != 0);
+    wire           oq_pop  = oq_byp || oq_deq;          // an O write this cycle
+    wire           oq_push = pipe && o_valid && !oq_byp;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            oq_wp <= 0; oq_rp <= 0; oq_n <= 0;
+        end else begin
+            if (oq_push) oq_wp <= oq_wp + 1'b1;
+            if (oq_deq)  oq_rp <= oq_rp + 1'b1;
+            oq_n <= oq_n + oq_push - oq_deq;
+        end
+    end
+    always @(posedge clk) begin
+        if (oq_push) begin
+            oq_row[oq_wp] <= o_row;
+            oq_tag[oq_wp] <= o_tag;
+        end
+    end
+`ifdef RAIJIN_TRACE
+    always @(posedge clk)
+        if (pipe && busy_r)
+            $display("TR c=%0d st=%0d g=%0d j=%0d smv=%b smtag=%h olast=%b al4=%b rv=%b pis=%b pc=%0d o0v=%b ov=%b otag=%0d vrd=%b oqn=%0d pop=%b owr=%0d",
+                cycles, state, g, j, sm_valid, sm_tag_in, sm_olast[0], al4, sm_rvalid[0], pissue, pcnt, o0_v, o_valid, o_tag, v_rd, oq_n, oq_pop, owr_cnt);
+`endif
+`ifndef SYNTHESIS
+    always @(posedge clk)
+        if (rst_n && oq_push && !oq_deq && oq_n == OQ)
+            $display("%t raijin_core ERROR: O write queue overflow", $time);
+`endif
+
     // ---- port 0 (read/write): O writes, V reads, score writes, bus ----
     integer mb;
     always @(*) begin
@@ -506,12 +604,12 @@ module raijin_core #(
         p0_mask = {NB*4{1'b0}};
         p0_addr = 8'd0;
         p0_din  = {NB*32{1'b0}};
-        if (o_valid) begin
+        if (pipe ? oq_pop : o_valid) begin
             p0_csb  = {NB{1'b0}};
             p0_web  = {NB{1'b0}};
             p0_mask = {NB*4{1'b1}};
-            p0_addr = AO + o_tag;
-            p0_din  = o_row;
+            p0_addr = AO + ((pipe && !oq_byp) ? oq_tag[oq_rp] : o_tag);
+            p0_din  = (pipe && !oq_byp) ? oq_row[oq_rp] : o_row;
         end else if (v_rd) begin
             p0_csb  = {NB{1'b0}};
             p0_addr = AV + acc_j;
@@ -537,8 +635,8 @@ module raijin_core #(
 
 `ifndef SYNTHESIS
     always @(posedge clk)
-        if (rst_n && (o_valid + v_rd + sb_we) > 1)
-            $display("%t raijin_core ERROR: SRAM port 0 conflict o=%b v=%b sb=%b", $time, o_valid, v_rd, sb_we);
+        if (rst_n && ((pipe ? oq_pop : o_valid) + v_rd + sb_we) > 1)
+            $display("%t raijin_core ERROR: SRAM port 0 conflict o=%b v=%b sb=%b", $time, pipe ? oq_pop : o_valid, v_rd, sb_we);
 `endif
 
     // ------------------------------------------------------------------
@@ -627,7 +725,9 @@ module raijin_core #(
             orow   <= {LP{1'b0}};
             qcnt   <= {LP{1'b0}};
             dcnt   <= 4'd0;
+            owr_cnt <= 0;
         end else begin
+            if (oq_pop) owr_cnt <= owr_cnt + 1'b1;
             if (we_r && creg && !busy_r) begin
                 if (cidx == 5'h01) offset <= wdata_r;
                 if (cidx == 5'h10) len    <= wdata_r[LN:0];
@@ -647,6 +747,7 @@ module raijin_core #(
                         done_r <= 1'b0;
                         cycles <= 32'd0;
                         skips  <= 32'd0;
+                        owr_cnt <= 0;
                         g      <= wdata_r[4] ? qrow / P : {LG{1'b0}};
                         j      <= 0;
                         qcnt   <= 0;
@@ -760,9 +861,21 @@ module raijin_core #(
                 F_STREAM: begin
                     j <= j + 1'b1;
                     if (last_jf) begin
-                        dcnt  <= 4'd6;
-                        state <= F_DRAIN;
+                        if (pipe && !last_g) begin
+                            // next group streams right behind this one
+                            g     <= g + 1'b1;
+                            qcnt  <= 0;
+                            state <= Q_LOAD;
+                        end else if (pipe) begin
+                            state <= P_WAIT;
+                        end else begin
+                            dcnt  <= 4'd6;
+                            state <= F_DRAIN;
+                        end
                     end
+                end
+                P_WAIT: begin
+                    if (owr_cnt == N) state <= S_DONE;
                 end
                 F_DRAIN: begin
                     dcnt <= dcnt - 1'b1;

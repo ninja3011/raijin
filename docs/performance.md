@@ -55,6 +55,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 | # | Feature | Status | Measured effect |
 | --- | --- | --- | --- |
 | 1 | Timing closure: four copies each of 1/l and the output shift amount (`rtl/raijin_dupreg.v`) | RTL merged; layout running | Cycles unchanged (357). The clock target is 50 MHz, which would give 2.29 GOPS (estimate) |
+| 2 | Group pipelining in the fused dataflow | RTL merged | Fused pass 357 → **173** cycles at P = 2 (2.06×, 74% utilization) and 197 → **111** at P = 4 (1.77×). That is 3.9 GOPS at 42 MHz, or 4.7 GOPS at 50 MHz. Unfused and decode are unchanged |
 
 ### 1. Timing closure
 
@@ -70,3 +71,33 @@ copies from `sky130_fd_sc_hd__dfxtp_1` instances. `opt_merge` only merges
 built-in cell types, so those copies survive. A synthesis check of
 `raijin_out` keeps all 24 shift-amount flops. Simulation uses a behavioural
 register instead. Latency is unchanged, and every test is still bit-exact.
+
+### 2. Group pipelining
+
+Before this change, each fused query group ran its whole tail before the next
+group could load: pipeline drain, reciprocal, output normalise and O write,
+about 28 of its 44 cycles. Now group g+1 loads its Q rows and streams its keys
+right behind group g. The only gap between two groups is the P cycles of the
+Q load, which uses SRAM port 1.
+
+| Mechanism | Where | What it does |
+| --- | --- | --- |
+| `first` / `last` key flags | `raijin_softmax_lane`, `raijin_acc_array` | On the first key of a group, the lane restarts m = −256 and l = 0 and the accumulators restart, without a clear cycle. On the last key, the lane latches the final l into its own divisor register and starts the reciprocal itself, so the next group's keys can update l while the division runs |
+| `acc_snap` | `raijin_core` | The finished group's P accumulator rows are copied one cycle after its last update lands (`al4`). The reciprocal (14 cycles) and the output stage then read the copy while the live accumulators already serve the next group |
+| Pipelined output issue | `raijin_core` | On the rising edge of the lane's `r_valid`, P output rows are issued from `acc_snap`, each with its own lane's 1/l |
+| O write queue (2P entries, with bypass) | `raijin_core` | During streaming, SRAM port 0 carries a V read every cycle. O rows are written on the P free cycles each group leaves, straight through when the queue is empty. A simulation check flags queue overflow and port-0 conflicts; neither occurs |
+| `P_WAIT` state | `raijin_core` | After the last group streams, the controller waits until all N O rows are written |
+
+The Q-row register needs no second buffer. The next group's Q rows reach
+`qreg` two cycles after their read, which is one cycle after the DPU has used
+the previous group's last key.
+
+**Cost (estimate):** `acc_snap` is P × 16 × 24 bits (768 flops at P = 2) and
+the queue is 2P × 132 bits (528 flops). That is about 1,300 flops, roughly 25%
+more than the 5,158 of `sram_p2_v2`. Measured area comes from the next
+hardening run.
+
+**Check:** every core test is bit-exact at P = 2 and P = 4. Decode mode (one
+group) and the unfused dataflow keep their old control path. Setting
+`RAIJIN_TRACE=1` for `tb/run_tests.py` prints a per-cycle trace of the
+pipelined controller.
