@@ -58,8 +58,14 @@
 //   0x5003  RD_LATENCY (3)
 //   0x5004..7 CYCLES (little endian)   0x5008..B SKIPS
 //   0x500C N, 0x500D D, 0x500E P, 0x500F version
-//   0x5010  LEN    decode: number of cached keys, 1..N
+//   0x5010  LEN    decode: number of cached keys, 1..N (1..2N with KVFMT INT4)
 //   0x5011  QROW   decode: query row (its output lands in O[QROW])
+//   0x5012  KVFMT  bit0: K is MXINT4, bit1: V is MXINT4. An INT4 region packs
+//                  two tokens per SRAM word (token t's 16 nibbles at byte offset
+//                  8t of its region, element 2b in the low nibble of byte b), so
+//                  with both bits set the cache holds 2N tokens. Each nibble
+//                  enters the INT8 datapath as x4 << 4.
+//   e_k / e_v exponents: 0x41tt / 0x42tt for tokens t = 0..2N-1
 `default_nettype none
 `ifdef RAIJIN_SKY130_SRAM
 `define RAIJIN_RAM sky130_sram_1kbyte_1rw1r_32x256_8
@@ -86,7 +92,9 @@ module raijin_core #(
     localparam LD  = (D  > 1) ? $clog2(D)  : 1;
     localparam LG  = (NG > 1) ? $clog2(NG) : 1;
     localparam LP  = (P  > 1) ? $clog2(P)  : 1;
-    localparam TW  = LG + LN;
+    localparam LK  = LN + 1;          // key index: up to 2N cached tokens (INT4)
+    localparam NK  = 2 * N;
+    localparam TW  = LG + LK;
     localparam VERSION = 8'h02;
     localparam NB  = 4;               // SRAM banks
     localparam NSB = (P + 1) / 2;     // banks holding the score buffer
@@ -125,8 +133,8 @@ module raijin_core #(
     // Small storage that stays in flip-flops: row exponents and 1/l
     // ------------------------------------------------------------------
     reg [7:0]     eqm [0:N-1];
-    reg [7:0]     ekm [0:N-1];
-    reg [7:0]     evm [0:N-1];
+    reg [7:0]     ekm [0:NK-1];
+    reg [7:0]     evm [0:NK-1];
     reg [7:0]     eom [0:N-1];
     reg [12:0]    rinv [0:N-1];
     reg [D*8-1:0] qreg [0:P-1];       // Q rows of the current group
@@ -138,7 +146,8 @@ module raijin_core #(
     reg               fused, decode, causal, multi, spec;
     reg [1:0]         mode;
     reg signed [7:0]  offset;
-    reg [LN:0]        len;
+    reg [LK:0]        len;
+    reg               k4, v4;         // KVFMT: MXINT4 K (bit 0), V (bit 1)
     reg [LN-1:0]      qrow;
     reg [31:0]        cycles, skips;
     assign busy = busy_r;
@@ -158,7 +167,7 @@ module raijin_core #(
     wire [LD-1:0] bcol   = boff[LD-1:0];
     wire [1:0]    bbank  = bcol[3:2];
     wire [1:0]    bbyte  = bcol[1:0];
-    wire [LN-1:0] erow   = boff[LN-1:0];
+    wire [LK-1:0] erow   = boff[LK-1:0];
     wire [1:0]    esel   = boff[9:8];
     wire          creg   = (region == 4'h5);
     wire [4:0]    cidx   = boff[4:0];
@@ -169,7 +178,7 @@ module raijin_core #(
     always @(posedge clk) begin
         if (we_r && !busy_r && region == 4'h4) begin
             case (esel)
-                2'd0: eqm[erow] <= wdata_r;
+                2'd0: if (erow < N) eqm[erow[LN-1:0]] <= wdata_r;
                 2'd1: ekm[erow] <= wdata_r;
                 2'd2: evm[erow] <= wdata_r;
                 default: ;
@@ -205,7 +214,7 @@ module raijin_core #(
 
     reg [4:0]    state;
     reg [LG-1:0] g;
-    reg [LN-1:0] j;
+    reg [LK-1:0] j;
     reg [LP-1:0] orow;
     reg [LP-1:0] qcnt;
     reg [3:0]    dcnt;
@@ -250,13 +259,13 @@ module raijin_core #(
         p1_addr = 8'd0;
         if (k_rd) begin
             p1_csb  = {NB{1'b0}};
-            p1_addr = AK + j;
+            p1_addr = AK + (k4 ? (j >> 1) : j);
         end else if (q_rd) begin
             p1_csb  = {NB{1'b0}};
             p1_addr = AQ + g * P + qcnt;
         end else if (s_rd) begin
             for (pb = 0; pb < NSB; pb = pb + 1) p1_csb[pb] = 1'b0;
-            p1_addr = AS + issue_tag;
+            p1_addr = AS + {g, j[LN-1:0]};
         end
     end
 
@@ -282,8 +291,21 @@ module raijin_core #(
         mu_d1  <= (state == U_SM_P1);  mu_d2  <= mu_d1;
         em_d1  <= (state == U_SM_P2);  em_d2  <= em_d1;
     end
-    wire [LG-1:0] g_d2 = tag_d2[LN +: LG];
-    wire [LN-1:0] j_d2 = tag_d2[LN-1:0];
+    wire [LG-1:0] g_d2 = tag_d2[LK +: LG];
+    wire [LK-1:0] j_d2 = tag_d2[LK-1:0];
+
+    // MXINT4 K/V: pick token t's half of the SRAM word and widen each nibble
+    // to INT8 as x4 << 4 (the host's e_k / e_v account for the 4-bit shift)
+    function [D*8-1:0] unpack4;
+        input [NB*32-1:0] w;
+        input             hi;
+        integer c;
+        begin
+            for (c = 0; c < D; c = c + 1)
+                unpack4[c*8 +: 8] = {w[(hi ? 64 : 0) + c*4 +: 4], 4'd0};
+        end
+    endfunction
+    wire [D*8-1:0] k_row = k4 ? unpack4(d1_r, j_d2[0]) : d1_r;
 
     integer qi;
     always @(posedge clk) begin
@@ -306,13 +328,13 @@ module raijin_core #(
     // In decode mode only the LEN cached rows count towards the maximum.
     // ------------------------------------------------------------------
     reg [7:0] emax_c, emax;
-    reg [4:0] dvr [0:N-1];
+    reg [4:0] dvr [0:NK-1];
     integer ei, ew, di;
-    reg [N*8-1:0] mt;     // pairwise max tree, log2(N) levels
+    reg [NK*8-1:0] mt;    // pairwise max tree over every cache row
     always @(*) begin
-        for (ei = 0; ei < N; ei = ei + 1)
-            mt[ei*8 +: 8] = (!decode || ei < len) ? evm[ei] : 8'd0;
-        for (ew = N / 2; ew >= 1; ew = ew / 2)
+        for (ei = 0; ei < NK; ei = ei + 1)
+            mt[ei*8 +: 8] = (decode ? (ei < len) : (ei < N)) ? evm[ei] : 8'd0;
+        for (ew = NK / 2; ew >= 1; ew = ew / 2)
             for (ei = 0; ei < ew; ei = ei + 1)
                 mt[ei*8 +: 8] = (mt[(2*ei)*8 +: 8] > mt[(2*ei+1)*8 +: 8]) ?
                                 mt[(2*ei)*8 +: 8] : mt[(2*ei+1)*8 +: 8];
@@ -321,7 +343,7 @@ module raijin_core #(
     reg [7:0] dtmp;
     always @(posedge clk) begin
         emax <= emax_c;
-        for (di = 0; di < N; di = di + 1) begin
+        for (di = 0; di < NK; di = di + 1) begin
             dtmp    = emax - evm[di];
             dvr[di] <= (dtmp > 8'd31) ? 5'd31 : dtmp[4:0];
         end
@@ -342,7 +364,7 @@ module raijin_core #(
             raijin_dpu #(.D(D), .TW(TW)) u_dpu (
                 .clk(clk), .rst_n(rst_n),
                 .in_valid(k_d2), .in_tag(tag_d2),
-                .a(qreg[gr]), .b(d1_r), .ea(eqm[qr]), .eb(ekm[j_d2]),
+                .a(qreg[gr]), .b(k_row), .ea(eqm[qr]), .eb(ekm[j_d2]),
                 .out_valid(dpu_valid[gr]), .out_tag(dpu_tag[gr*TW +: TW]),
                 .dot(dpu_dot[gr*20 +: 20]), .esum(dpu_esum[gr*9 +: 9])
             );
@@ -371,9 +393,9 @@ module raijin_core #(
     wire [P-1:0]    sm_rvalid;
     wire [P*13-1:0] sm_r;
     wire [P-1:0]    sm_ofirst, sm_olast;
-    wire            sm_first = pipe && (sm_tag_in[LN-1:0] == {LN{1'b0}});
-    wire [LG-1:0]   sm_g     = sm_tag_in[LN +: LG];
-    wire [LN-1:0]   sm_j     = sm_tag_in[LN-1:0];
+    wire            sm_first = pipe && (sm_tag_in[LK-1:0] == {LK{1'b0}});
+    wire [LG-1:0]   sm_g     = sm_tag_in[LK +: LG];
+    wire [LK-1:0]   sm_j     = sm_tag_in[LK-1:0];
     wire            sm_last  = pipe && (causal ? (sm_j == sm_g * P + P - 1) : (sm_j == N - 1));
     wire [P-1:0]    sm_omask;
 
@@ -401,7 +423,8 @@ module raijin_core #(
 
     // score buffer writes (unfused): scores from the DPUs, then p codes
     wire            sb_we   = !fused && (dpu_valid[0] || sm_ovalid[0]);
-    wire [TW-1:0]   sb_wtag = dpu_valid[0] ? dpu_tag[0 +: TW] : sm_otag[0 +: TW];
+    wire [TW-1:0]   sb_wtag_f = dpu_valid[0] ? dpu_tag[0 +: TW] : sm_otag[0 +: TW];
+    wire [LG+LN-1:0] sb_wtag = {sb_wtag_f[LK +: LG], sb_wtag_f[LN-1:0]};   // {g, j}
     reg  [NB*32-1:0] sb_wdata;
     integer wi;
     always @(*) begin
@@ -423,7 +446,7 @@ module raijin_core #(
     // two register stages later the V row arrives and the array updates.
     // ------------------------------------------------------------------
     reg            acc_valid;
-    reg [LN-1:0]   acc_j;
+    reg [LK-1:0]   acc_j;
     reg [P*9-1:0]  acc_p;
     reg [P*4-1:0]  acc_sa, acc_sb;
     reg [P*5-1:0]  acc_delta;
@@ -432,7 +455,7 @@ module raijin_core #(
     always @(*) begin
         if (fused) begin
             acc_valid = sm_ovalid[0];
-            acc_j     = sm_otag[0 +: LN];
+            acc_j     = sm_otag[0 +: LK];
             acc_p     = sm_p;
             acc_sa    = sm_sa;
             acc_sb    = sm_sb;
@@ -461,7 +484,7 @@ module raijin_core #(
     wire v_rd = acc_valid;
 
     reg            av1, av2;
-    reg [LN-1:0]   aj1, aj2;
+    reg [LK-1:0]   aj1, aj2;
     reg [P*9-1:0]  ap1, ap2;
     reg [P*4-1:0]  asa1, asa2, asb1, asb2;
     reg [P*5-1:0]  ad1, ad2;
@@ -482,7 +505,7 @@ module raijin_core #(
         end
     end
     always @(posedge clk) begin
-        ag1 <= sm_otag[LN +: LG];  ag2 <= ag1;  ag3 <= ag2;  ag4 <= ag3;
+        ag1 <= sm_otag[LK +: LG];  ag2 <= ag1;  ag3 <= ag2;  ag4 <= ag3;
     end
     always @(posedge clk) begin
         aj1 <= acc_j;      aj2 <= aj1;
@@ -497,7 +520,7 @@ module raijin_core #(
     wire [P*D*24-1:0] acc;
     raijin_acc_array #(.R(P), .D(D)) u_acc (
         .clk(clk), .rst_n(rst_n), .clear(acc_clear), .mf(mf),
-        .v(d0_r), .dv(dvr[aj2]),
+        .v(v4 ? unpack4(d0_r, aj2[0]) : d0_r), .dv(dvr[aj2]),
         .en(aen2), .first(af2), .p(ap2), .sa(asa2), .sb(asb2), .delta(ad2),
         .acc(acc)
     );
@@ -637,7 +660,7 @@ module raijin_core #(
             p0_din  = (pipe && !oq_byp) ? oq_row[oq_rp] : o_row;
         end else if (v_rd) begin
             p0_csb  = {NB{1'b0}};
-            p0_addr = AV + acc_j;
+            p0_addr = AV + (v4 ? (acc_j >> 1) : acc_j);
         end else if (sb_we) begin
             for (mb = 0; mb < NSB; mb = mb + 1) begin
                 p0_csb[mb] = 1'b0;
@@ -683,10 +706,10 @@ module raijin_core #(
             if (re_r) begin
                 case (region)
                     4'h4: case (esel)
-                              2'd0: rd_reg <= eqm[erow];
+                              2'd0: rd_reg <= eqm[erow[LN-1:0]];
                               2'd1: rd_reg <= ekm[erow];
                               2'd2: rd_reg <= evm[erow];
-                              default: rd_reg <= eom[erow];
+                              default: rd_reg <= eom[erow[LN-1:0]];
                           endcase
                     4'h5: case (cidx)
                               5'h00: rd_reg <= {3'd0, decode, mode, fused, 1'b0};
@@ -707,6 +730,7 @@ module raijin_core #(
                               5'h0F: rd_reg <= VERSION;
                               5'h10: rd_reg <= len;
                               5'h11: rd_reg <= qrow;
+                              5'h12: rd_reg <= {6'd0, v4, k4};
                               default: rd_reg <= 8'd0;
                           endcase
                     default: rd_reg <= 8'd0;
@@ -748,11 +772,13 @@ module raijin_core #(
             mode   <= 2'd0;
             offset <= 8'sd0;
             len    <= N;
+            k4     <= 1'b0;
+            v4     <= 1'b0;
             qrow   <= {LN{1'b0}};
             cycles <= 32'd0;
             skips  <= 32'd0;
             g      <= {LG{1'b0}};
-            j      <= {LN{1'b0}};
+            j      <= {LK{1'b0}};
             orow   <= {LP{1'b0}};
             qcnt   <= {LP{1'b0}};
             dcnt   <= 4'd0;
@@ -763,7 +789,11 @@ module raijin_core #(
             else if (since_last != 5'd31)                         since_last <= since_last + 1'b1;
             if (we_r && creg && !busy_r) begin
                 if (cidx == 5'h01) offset <= wdata_r;
-                if (cidx == 5'h10) len    <= wdata_r[LN:0];
+                if (cidx == 5'h10) len    <= wdata_r[LK:0];
+                if (cidx == 5'h12) begin
+                    k4 <= wdata_r[0];
+                    v4 <= wdata_r[1];
+                end
                 if (cidx == 5'h11) qrow   <= wdata_r[LN-1:0];
             end
             if (busy_r) begin
@@ -801,7 +831,7 @@ module raijin_core #(
                 end
                 // ---------------- unfused ----------------
                 U_QK: begin
-                    j <= j + 1'b1;
+                    j <= last_j ? {LK{1'b0}} : j + 1'b1;   // wrap at N (j is LK bits)
                     if (last_j) begin
                         g <= g + 1'b1;
                         if (last_g) begin
@@ -825,11 +855,11 @@ module raijin_core #(
                     state <= U_SM_P1;
                 end
                 U_SM_P1: begin
-                    j <= j + 1'b1;
+                    j <= last_j ? {LK{1'b0}} : j + 1'b1;   // wrap at N (j is LK bits)
                     if (last_j) state <= U_SM_P2;
                 end
                 U_SM_P2: begin
-                    j <= j + 1'b1;
+                    j <= last_j ? {LK{1'b0}} : j + 1'b1;   // wrap at N (j is LK bits)
                     if (last_j) begin
                         dcnt  <= 4'd4;
                         state <= U_SM_DRAIN;
@@ -859,7 +889,7 @@ module raijin_core #(
                     state <= U_PV;
                 end
                 U_PV: begin
-                    j <= j + 1'b1;
+                    j <= last_j ? {LK{1'b0}} : j + 1'b1;   // wrap at N (j is LK bits)
                     if (last_j) begin
                         dcnt  <= 4'd4;
                         state <= U_PV_DRAIN;

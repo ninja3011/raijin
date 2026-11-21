@@ -58,6 +58,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 | 2 | Group pipelining in the fused dataflow | RTL merged | Fused pass 357 → **173** cycles at P = 2 (2.06×, 74% utilization) and 197 → **111** at P = 4 (1.77×). That is 3.9 GOPS at 42 MHz, or 4.7 GOPS at 50 MHz. Unfused and decode are unchanged |
 | 3 | Causal prefill (CTRL bit 5) | RTL merged | One causal fused pass: **153** cycles at P = 2 and **97** at P = 4. Building the same outputs from 16 decode steps takes about 650 cycles at P = 2 and 680 at P = 4, so prefill is 4.2× to 7× faster, before counting the host traffic each decode step needs |
 | 4 | Multi-query decode: GQA/MQA and speculative verify (CTRL bits 6, 7) | RTL merged | One step serves P query rows at LEN = 16: **49** cycles for 2 rows at P = 2, against 96 for 2 single steps (1.96×), and **53** cycles for 4 rows at P = 4, against 200 (3.77×). Decode throughput per cycle scales with P |
+| 6 | MXINT4 KV cache (KVFMT 0x5012: bit 0 K, bit 1 V) | RTL merged | With K and V both INT4, the same SRAM holds **2N = 32 tokens** instead of 16, and every step is bit-exact. Accuracy cost is mean cosine 0.965 to 0.983 against 0.9996+ for INT8. V-only INT4 keeps 0.991 |
 | 7 | Streaming KV cache with attention sinks (StreamingLLM) | Test and host policy, no RTL change | Generation runs past the 16-row cache. Over 48 tokens with 4 sinks, every step is bit-exact; mean cosine vs FP32 is 0.99983 overall and 0.99979 for tokens past the cache size |
 
 ### 1. Timing closure
@@ -195,3 +196,57 @@ To be clear about the claim: this is a host-side policy that Raijin's
 order-free dataflow supports at no cost. It is not a hardware block. The
 hardware part of the claim is that a decode step costs the same whichever
 rows are live.
+
+### 6. MXINT4 KV cache
+
+In LLM decode the KV cache, not the arithmetic, sets how long a context fits
+on chip. The KVFMT register (0x5012) stores K (bit 0) and/or V (bit 1) as
+MXINT4: 16 four-bit elements with one shared E8M0 exponent per token.
+
+- **Layout.** An INT4 region packs two tokens per 128-bit SRAM word. Token t's
+  eight bytes sit at byte offset 8t of the region, so the host writes them at
+  0x1000 + 8t + b (K) or 0x2000 + 8t + b (V). Element 2b is the low nibble of
+  byte b. With both bits set, the 16-word K and V regions hold 32 tokens, and
+  decode takes LEN up to 32.
+- **Datapath.** The K read uses word j >> 1 and the V read uses word
+  acc_j >> 1. A nibble mux picks the token's half and widens each element to
+  INT8 as x4 << 4. The MAC arrays, softmax and accumulators are unchanged,
+  so this costs no extra cycles. With 2 fraction bits, x4 / 4 equals
+  (x4 << 4) / 64, so the host's e_k and e_v keep their MXINT8 meaning.
+- **Index widening.** The key index and the tags grew by one bit, to LK =
+  log2(N) + 1. e_k, e_v and the dv shifts now have 2N entries, and the e_vmax
+  tree spans 2N rows. The unfused key counters wrap explicitly at N. The extra
+  state is about 340 flops (estimate).
+- **Model.** `rm.mx_quantize4`, `rm.pack4` and `rm.prepare_kv4`. The INT8
+  golden model applies unchanged because it is given x4 << 4.
+
+`test_int4_kv_cache` checks full unfused, fused and causal passes with an INT4
+K and V, a 32-token decode cache for three tensor families, and a causal pass
+with INT8 K and INT4 V. All are bit-exact (`results/kv4_N16_D16.txt`).
+
+**Accuracy.** Mean cosine against FP32 causal attention over a 32-token decode:
+
+| Tensor family | INT8 K, INT8 V (model) | INT4 K, INT4 V (RTL) |
+| --- | --- | --- |
+| random | 0.99984 | 0.98307 |
+| sharp (scale 2.5) | 0.99975 | 0.96525 |
+| outliers | 0.99960 | 0.97689 |
+
+A model-only sweep over 4 × 32 tokens per family shows where the loss
+comes from:
+
+| Family | K8 V8 | K4 V8 | K8 V4 | K4 V4 |
+| --- | --- | --- | --- | --- |
+| random | 0.99985 | 0.99504 | 0.99140 | 0.98683 |
+| sharp | 0.99970 | 0.96558 | 0.99118 | 0.95747 |
+| outliers | 0.99971 | 0.97452 | 0.99190 | 0.96656 |
+
+Keys are the sensitive half when attention is sharp, because a 4-bit key
+error moves the score inside the exponential. That matches what KIVI and
+KVQuant report for LLM caches. In practice:
+
+- Use KVFMT = 2 (INT8 K, INT4 V) when accuracy comes first. This shrinks V
+  traffic but not the token count.
+- Use KVFMT = 3 for twice the context.
+- Feature 9 (adaptive precision) targets the gap: it would keep INT8 for
+  tokens whose exponent spread shows outliers.

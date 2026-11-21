@@ -314,6 +314,39 @@ def mx_quantize(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return q, e
 
 
+def mx_quantize4(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Quantise each row to MXINT4: INT4 elements in [-8, 7] with 2 fraction
+    bits and one shared E8M0 exponent per row. Returns the elements as the
+    INT8 datapath sees them (x4 << 4), so the INT8 golden model applies as is,
+    together with the exponents."""
+    x = np.asarray(x, dtype=np.float64)
+    q4 = np.zeros(x.shape, dtype=np.int64)
+    e = np.zeros(x.shape[0], dtype=np.int64)
+    for i, row in enumerate(x):
+        amax = float(np.max(np.abs(row)))
+        ex = 0 if amax == 0 else int(np.ceil(np.log2(amax * 4 / 7)))
+        ex = min(max(ex, -127), 128)
+        q4[i] = np.clip(np.round(row / 2.0 ** ex * 4), -8, 7)
+        e[i] = ex + EXP_BIAS
+    return q4 * 16, e
+
+
+def pack4(row8: Sequence[int]) -> List[int]:
+    """Pack one MXINT4 row (given as x4 << 4) into 8 bytes: element 2b in the
+    low nibble of byte b, element 2b+1 in the high nibble."""
+    n = [(int(x) >> 4) & 0xF for x in row8]
+    return [n[2 * b] | (n[2 * b + 1] << 4) for b in range(len(n) // 2)]
+
+
+def prepare_kv4(qf, kf, vf):
+    """Like prepare(), but K and V in MXINT4 (returned as x4 << 4)."""
+    d = qf.shape[1]
+    q, eq = mx_quantize(qf * (np.log2(np.e) / np.sqrt(d)))
+    k, ek = mx_quantize4(kf)
+    v, ev = mx_quantize4(vf)
+    return q, eq, k, ek, v, ev
+
+
 def mx_dequantize(q: np.ndarray, e: np.ndarray) -> np.ndarray:
     q = np.asarray(q, dtype=np.float64)
     e = np.asarray(e, dtype=np.float64)

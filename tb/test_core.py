@@ -338,3 +338,104 @@ async def test_streaming_kv_cache(dut):
     dut._log.info(line)
     with open(os.path.join(os.path.dirname(__file__), "..", "results", f"streaming_N{N}_D{D}.txt"), "w") as f:
         f.write(line + chr(10))
+
+
+async def load_kv4(bus, q, eq, k, ek, v, ev):
+    """Q as MXINT8 rows; K and V packed MXINT4, token t at byte 8t of its region."""
+    for r in range(N):
+        for c in range(D):
+            await bus.write(0x0000 + r * D + c, int(q[r][c]))
+        await bus.write(0x4000 + r, int(eq[r]))
+    for base, mat in ((0x1000, k), (0x2000, v)):
+        for t in range(mat.shape[0]):
+            for b, byte in enumerate(rm.pack4(mat[t])):
+                await bus.write(base + 8 * t + b, byte)
+    for base, ex in ((0x4100, ek), (0x4200, ev)):
+        for t in range(len(ex)):
+            await bus.write(base + t, int(ex[t]))
+
+
+@cocotb.test()
+async def test_int4_kv_cache(dut):
+    """MXINT4 K/V (KVFMT = 1): full passes on N tokens, then a 2N-token KV cache
+    in the same SRAM, every step bit-exact. Accuracy is compared with the same
+    steps run with an MXINT8 cache (model only, it cannot hold 2N tokens)."""
+    bus = await setup(dut)
+    await bus.write(0x5012, 3)
+    assert await bus.read(0x5012) == 3
+    rng = np.random.default_rng(int(os.environ.get("RAIJIN_SEED", 7)) + 41)
+    summary = []
+    # full passes with an INT4 K/V
+    qf, kf, vf = rm.random_case(rng, n=N, d=D, scale=1.5)
+    args = rm.prepare_kv4(qf, kf, vf)
+    await load_kv4(bus, *args)
+    ref = rm.reference(qf, kf, vf)
+    for fused, causal in ((False, False), (True, False), (True, True)):
+        exp = rm.attention(*args, fused=fused, mode=rm.MODE_EXACT, causal=causal)
+        o, eo, cycles, skips = await run_pass(bus, fused, rm.MODE_EXACT, causal=causal)
+        tag = f"kv4 full fused={int(fused)} causal={int(causal)}"
+        assert np.array_equal(o, exp.o) and np.array_equal(eo, exp.eo), f"{tag}: mismatch"
+        assert skips == exp.skips
+        if not causal:
+            got = rm.mx_dequantize(o, eo)
+            cos = float(np.sum(got * ref) / np.linalg.norm(got) / np.linalg.norm(ref))
+            summary.append(f"{tag:34s} cycles={cycles:4d} cos={cos:.5f}")
+            dut._log.info(summary[-1])
+    # a 2N-token KV cache
+    T = 2 * N
+    for name, kw in CASES:
+        qf, kf, vf = rm.random_case(rng, n=T, d=D, **kw)
+        q, eq, k, ek, v, ev = rm.prepare_kv4(qf, kf, vf)
+        q8, eq8, k8, ek8, v8, ev8 = rm.prepare(qf, kf, vf)
+        ref = rm.reference_causal(qf, kf, vf)
+        cos4, cos8 = [], []
+        mq = np.zeros((N, D), dtype=np.int64)
+        meq = np.zeros(N, dtype=np.int64)
+        for t in range(T):
+            row = t % N
+            mq[row], meq[row] = q[t], eq[t]
+            for c in range(D):
+                await bus.write(0x0000 + row * D + c, int(q[t][c]))
+            await bus.write(0x4000 + row, int(eq[t]))
+            for base, mat in ((0x1000, k), (0x2000, v)):
+                for b, byte in enumerate(rm.pack4(mat[t])):
+                    await bus.write(base + 8 * t + b, byte)
+            await bus.write(0x4100 + t, int(ek[t]))
+            await bus.write(0x4200 + t, int(ev[t]))
+            await bus.write(0x5010, t + 1)
+            await bus.write(0x5011, row)
+            await bus.write(0x5000, 1 | (1 << 4))
+            await wait_done(dut)
+            o, eo, cycles, _ = await read_out(bus, rows=[row])
+            exp = rm.attention_decode(mq, meq, k, ek, v, ev, qrow=row, length=t + 1)
+            assert np.array_equal(o[row], exp.o[0]), f"{name} t={t}: rtl={o[row]} model={exp.o[0]}"
+            assert eo[row] == exp.eo[0]
+            got = rm.mx_dequantize(o[row:row + 1], eo[row:row + 1])[0]
+            cos4.append(float(np.dot(got, ref[t]) / np.linalg.norm(got) / np.linalg.norm(ref[t])))
+            e8 = rm.attention_decode(q8, eq8, k8, ek8, v8, ev8, qrow=t, length=t + 1)
+            g8 = rm.mx_dequantize(e8.o, e8.eo)[0]
+            cos8.append(float(np.dot(g8, ref[t]) / np.linalg.norm(g8) / np.linalg.norm(ref[t])))
+            if t == T - 1:
+                last_cycles = cycles
+        summary.append(f"kv4 decode {name:8s} tokens={T} cycles@len{T}={last_cycles:3d} "
+                       f"mean cos INT4={np.mean(cos4):.5f} (INT8 cache, model={np.mean(cos8):.5f})")
+        dut._log.info(summary[-1])
+    # K in MXINT8, V in MXINT4 (KVFMT = 2): the accuracy-first setting
+    qf, kf, vf = rm.random_case(rng, n=N, d=D, scale=2.5)
+    q, eq, k, ek, _, _ = rm.prepare(qf, kf, vf)
+    _, _, _, _, v, ev = rm.prepare_kv4(qf, kf, vf)
+    await bus.write(0x5012, 2)
+    for r in range(N):
+        for c in range(D):
+            await bus.write(0x0000 + r * D + c, int(q[r][c]))
+            await bus.write(0x1000 + r * D + c, int(k[r][c]))
+        for b, byte in enumerate(rm.pack4(v[r])):
+            await bus.write(0x2000 + 8 * r + b, byte)
+        for base, ex in ((0x4000, eq), (0x4100, ek), (0x4200, ev)):
+            await bus.write(base + r, int(ex[r]))
+    exp = rm.attention(q, eq, k, ek, v, ev, fused=True, mode=rm.MODE_EXACT, causal=True)
+    o, eo, _, _ = await run_pass(bus, True, rm.MODE_EXACT, causal=True)
+    assert np.array_equal(o, exp.o) and np.array_equal(eo, exp.eo), "K8/V4 causal pass mismatch"
+    await bus.write(0x5012, 0)
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", f"kv4_N{N}_D{D}.txt"), "w") as f:
+        f.write(chr(10).join(summary) + chr(10))
