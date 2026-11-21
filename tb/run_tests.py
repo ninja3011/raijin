@@ -18,6 +18,9 @@ SOURCES = [RTL / f for f in (
     "raijin_acc_array.v", "raijin_dupreg.v", "raijin_rope.v", "raijin_out.v", "raijin_mem.v", "raijin_core.v",
     "raijin_spi.v", "raijin_chip.v")]
 
+# RAIJIN_WAVES=1 dumps a VCD (for power annotation); pair with COCOTB_TEST_FILTER to pick one test
+WAVES = bool(os.environ.get("RAIJIN_WAVES"))
+
 BLOCKS = ["raijin_exp2", "raijin_requant", "raijin_dpu", "raijin_out", "raijin_softmax_lane", "raijin_rope"]
 
 
@@ -50,13 +53,13 @@ def run(top, module, sim, params=None, extra_env=None, macro=False):
         sources = [s for s in sources if s.name != "raijin_mem.v"] + [macro_model(build_dir)]
         defines = dict(defines, RAIJIN_SKY130_SRAM=1)
     runner.build(sources=sources, hdl_toplevel=top, build_dir=build_dir, defines=defines,
-                 parameters=params or {}, always=True, build_args=build_args, waves=False,
+                 parameters=params or {}, always=True, build_args=build_args, waves=WAVES,
                  timescale=("1ns", "1ps"))
     env = dict(extra_env or {})
     env["COCOTB_TOPLEVEL"] = top
     os.environ.update(env)
     res = runner.test(hdl_toplevel=top, test_module=module, test_dir=ROOT / "tb",
-                      build_dir=build_dir, extra_env=env)
+                      build_dir=build_dir, extra_env=env, waves=WAVES)
     return res
 
 
