@@ -88,3 +88,16 @@ if { [info exists ::env(OPENLANE_SDC_IDEAL_CLOCKS)] && $::env(OPENLANE_SDC_IDEAL
 # ~5.7 ns propagated clock latency at ss.)
 # ---------------------------------------------------------------------------
 set_false_path -from [get_ports {sck cs_n io_in[*] rst_n}]
+
+# crst_s (raijin_chip.v) is the core's async-assert, sync-release reset
+# synchroniser on gclk. srst_n reaches only its two flops' RESET_B pins from
+# the clk side; that crossing is asynchronous by design. Match the flops
+# through the nets their Q pins drive (crst_s[0], crst_s[1]).
+set raijin_crst_flops [list]
+foreach raijin_q [get_pins -quiet -of_objects [get_nets -quiet {crst_s[0] crst_s[1]}] -filter "direction == output"] {
+    lappend raijin_crst_flops [get_full_name [get_cells -of_objects $raijin_q]]
+}
+puts "raijin_chip.sdc: crst_s synchroniser flops: $raijin_crst_flops"
+foreach raijin_f $raijin_crst_flops {
+    set_false_path -to [get_pins $raijin_f/RESET_B]
+}

@@ -111,5 +111,7 @@
         "sky130_fd_sc_hd__clkdlybuf4s*"
     ],
     "PNR_SDC_FILE": "dir::raijin_chip.sdc",
-    "SIGNOFF_SDC_FILE": "dir::raijin_chip.sdc"
+    "SIGNOFF_SDC_FILE": "dir::raijin_chip.sdc",
+    "PL_RESIZER_HOLD_SLACK_MARGIN": 0.5,
+    "GRT_RESIZER_HOLD_SLACK_MARGIN": 0.5
 }
