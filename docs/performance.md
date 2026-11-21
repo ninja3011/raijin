@@ -391,6 +391,11 @@ exact float RoPE, `results/rope_N16_D16.txt`):
 | sharp | 0.99941 | 0.99946 | 0.99981 | 0.99823 |
 | outliers | 0.99893 | 0.99905 | 0.99921 | 0.99940 |
 
-The cost against the same passes without RoPE is at most about 0.0006 cosine
-on full passes. It comes from rounding the rotated elements back to INT8.
+On the same tensors with and without RoPE (the model sweep above, fused
+pass), RoPE costs 0.0001 cosine on random data, 0.0005 on sharp attention
+and 0.0017 on outlier-heavy data. The loss comes from rounding the rotated
+elements back to INT8, and it is largest where a few large elements dominate
+a row. A wider rotated-row format, or per-row re-normalization after
+rotation, would recover it; the adaptive-precision feature is the natural
+place for that.
 
