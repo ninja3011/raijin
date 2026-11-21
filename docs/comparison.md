@@ -10,7 +10,7 @@ This note places Raijin next to the best-known published attention accelerators,
 | SpAtten 1/8 | HPCA 2021 | 40 nm | 1 GHz | 1.55 mm² | 360 GOP/s | 382 GOP/J | Synthesis; SRAM from CACTI |
 | SpAtten (full) | HPCA 2021 | 40 nm | not stated | 18.71 mm² | 1.61 TFLOPS (BERT), 0.43 TFLOPS (GPT-2) | 8.30 W total, about 70% of it DRAM | Synthesis; SRAM from CACTI, HBM from Ramulator |
 | ELSA (one unit) | ISCA 2021 | 40 nm | 1 GHz | 1.255 mm² (2.15 mm² with its 36 KB memories) | 1.088 TOPS peak | about 730 GOPS/W (1.49 W with memories) | Post-layout (Design Compiler, place and route) |
-| **Raijin, P = 2** | this work | 130 nm (sky130) | 45 MHz (tt) | 4.84 mm² die; 0.98–1.16 mm² std cells + 4 × 1 KB SRAM | 4.26 GOPS (N = 16 fused), 5.76 GOPS peak | power being re-measured with real activity | **Post-layout, LVS clean, open PDK, open flow** |
+| **Raijin, P = 2** | this work | 130 nm (sky130) | 49.3 MHz (tt) | 4.84 mm² die; 1.146 mm² std cells + 4 × 1 KB SRAM | 4.67 GOPS (N = 16 fused), 6.3 GOPS peak | 67 GOPS/W (70.3 mW during a fused pass, gate-level activity) | **Post-layout, LVS clean, open PDK, open flow** |
 | Raijin, P = 8 (model) | this work | 130 nm | 45 MHz | not laid out | 23.0 GOPS peak, 22.9 GOPS at N = 128 | — | Cycle model validated against RTL |
 
 Sources: SpAtten (arXiv 2012.09852, Tables I–III, Section V); ELSA (ISCA 2021, Table I, Sections V-C and V-D); A3 (arXiv 2002.10941), whose hardware figures here are the ones SpAtten reports for it.
@@ -29,14 +29,15 @@ These factors are rough. Real 130 nm logic is usually slower than 308 MHz, so th
 | A3 | 308 MHz | 22.0 mm² | 68 | 3.1 | 31 |
 | SpAtten 1/8 | 308 MHz | 16.4 mm² | 111 | 6.8 | 44 |
 | ELSA (with memories) | 308 MHz | 22.7 mm² | 335 | 14.8 | 84 |
-| Raijin P = 2 (measured clock) | 45 MHz | 4.84 mm² die | 4.26 | 0.88 | pending |
+| Raijin P = 2 (measured clock) | 49.3 MHz | 4.84 mm² die | 4.67 | 0.96 | 67 |
 | Raijin P = 2 at the same 308 MHz | 308 MHz | 4.84 mm² die | 29 | 6.0 | — |
 
 How to read this honestly:
 - On raw throughput the prior designs are 2–16x larger machines (128 to 1,024 multipliers against Raijin's 64 MAC lanes at P = 2), and run at a far higher clock. Raijin's peak per multiplier per cycle (2 ops) is the same as theirs; the gap is size and clock, not architecture.
 - Area efficiency at equal clock is in the same range as A3 and SpAtten 1/8 even though Raijin's figure uses the whole padded die at 40% utilisation and real OpenRAM macros, and that it is a post-layout number rather than synthesis.
+- Energy efficiency (67 GOP/J, measured from gate-level activity) is above the normalised A3 and SpAtten 1/8 figures and below ELSA's. This comparison is the least certain one: the prior figures are synthesis or CACTI estimates scaled by a rough voltage factor, and Raijin's SRAM power is a constant from the OpenRAM library.
 - ELSA's lead comes from approximation (hash-based candidate selection skips most keys before any dot product) and from a 1 GHz post-layout clock in a commercial 40 nm library. Raijin computes every score exactly and gets its skipping after the score (key skip, feature 8), which is accuracy-safe but saves memory traffic rather than MACs.
-- Raijin's 45 MHz is limited by the open sky130 standard cells and OpenRAM macros (the SRAM read path is on the critical path). Closing timing is item 5 of the plan.
+- Raijin's 49.3 MHz is limited by the open sky130 standard cells and OpenRAM macros (the SRAM read path is on the critical path). The layout is 1.4% short of 50 MHz at tt.
 
 ## What Raijin contributes
 

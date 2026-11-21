@@ -102,27 +102,22 @@ broadcast no longer appears among the worst paths. (The Magic DRC count of
 11.3 M is identical to v2, and every one of those errors is inside the
 OpenRAM macros.)
 
-**Full-feature layout** (`sram_p2_speed`, commit cdfef3d, features 1 to 11,
-core only, without the chip-top clock gate):
+**Full-feature layouts**, core only, without the chip-top clock gate: `sram_p2_speed` (commit cdfef3d, features 1 to 11) and `sram_p2_speed2` (commit 008e43b, features 1 to 14 with the carry-free rounding of 1b).
 
-| Metric | sram_p2_dupreg | sram_p2_speed |
-| --- | --- | --- |
-| Setup WNS / TNS, tt | −2.34 / −89.5 ns | −2.31 / −99.0 ns (about 45 MHz) |
-| Setup WNS, ff / ss | +6.93 / −26.7 ns | +6.54 / −26.2 ns |
-| Hold violations (ss only) | 81 (−1.03 ns) | 192 (−1.28 ns) |
-| Route DRC / antenna / LVS | 0 / 0 / clean | 0 / 0 / clean |
-| Standard-cell area | 0.977 mm² | 1.161 mm² (+19%) |
-| Flops | 5,215 | 7,088 |
-| Utilisation | 36.5% | 40.4% |
-| Power, tt (tool default activity) | 36.5 mW | 126.8 mW |
+| Metric | sram_p2_dupreg | sram_p2_speed | sram_p2_speed2 |
+| --- | --- | --- | --- |
+| Setup WNS / TNS, tt | −2.34 / −89.5 ns | −2.31 / −99.0 ns (about 45 MHz) | **−0.342 / −0.91 ns (about 49.3 MHz)** |
+| Setup WNS, ff / ss | +6.93 / −26.7 ns | +6.54 / −26.2 ns | +6.48 / −17.57 ns |
+| Hold violations (ss only) | 81 (−1.03 ns) | 192 (−1.28 ns) | 103 over three ss RC corners (−1.55 ns), all input-port paths |
+| Route DRC / antenna / LVS | 0 / 0 / clean | 0 / 0 / clean | 0 / 1 net / clean |
+| Standard-cell area | 0.977 mm² | 1.161 mm² (+19%) | 1.146 mm² (+17%) |
+| Flops | 5,215 | 7,088 | 7,086 |
+| Utilisation | 36.5% | 40.4% | 40.1% |
+| Power, tt, gate-level activity | — | — | 70.3 mW during a fused pass, 43.2 mW averaged over load + pass + decode |
 
-Features 2 to 11 leave the critical path unchanged: the worst paths are still
-the output-rounding paths that 1b removes. The 3.4× power figure is not yet
-explained. The extra logic is 19% more area and 36% more flops, which can't
-account for it. A per-group breakdown (clock, sequential, combinational,
-macro) is being taken from both runs. The figure is also a vectorless
-estimate at the tool's default switching activity, for a core whose clock
-the chip top gates off most of the time.
+Features 2 to 14 leave the clock period unchanged, and 1b removes the rounding carry chain that was the worst path, taking tt slack from −2.31 to −0.34 ns. The ss hold violations are all from the input pins (addr, wdata, we, re, rst_n) to their first flop: the base SDC's 4 ns input delay is shorter than the ss clock latency (about 5.7 ns). Register-to-register hold at ss is +0.82 ns. On the chip top those pins are internal or synchronised, and `openlane/raijin_chip.sdc` false-paths the asynchronous pins (SPI and the reset, which now has a two-flop synchroniser).
+
+Power comes from a gate-level simulation of the routed netlist (`tb/run_gl.py`, `results/power_gl_sram_p2_speed2.md`) with 100% of pins annotated. A fused pass at N = d = 16, P = 2 takes 3.46 µs at 50 MHz and **243 nJ**, which is **67 GOPS/W**. Of the 70.3 mW, 15.9 mW is the clock tree, which the chip-top gate turns off when idle, and 7.7 mW is the OpenRAM library's constant SRAM figure. The earlier vectorless figures (32 to 127 mW) were wrong in both directions.
 
 **1b. Carry-free output rounding.** The five worst remaining paths all start
 at a shift-amount copy and end at an O-row flop. They pass through about
@@ -135,7 +130,7 @@ shift,
 so the add becomes a barrel shift and a one-bit increment ahead of the 8-bit
 saturation, with the same bits out. `raijin_out` now uses that form. The
 block and core suites are unchanged and bit-exact; the next layout,
-`sram_p2_speed`, will measure the gain.
+`sram_p2_speed2`, measured the gain: tt WNS −2.31 → −0.342 ns.
 
 ### 2. Group pipelining
 
@@ -822,7 +817,7 @@ OpenROAD's power report at tt (vectorless, nominal SPEF), in mW:
 | Macros (4 SRAMs) | 7.7 | 7.7 |
 | Total | 32.3 | 84.9 |
 
-The 3.4x jump is an artefact of vectorless activity, not a real cost. The SRAM data outputs are black boxes with activity 0, so in dupreg the whole datapath behind them looks idle (about 0.005 toggles per cycle), which understates power. In the speed run the datapath is driven from propagated flop sources instead (about 0.76 toggles per cycle, more than real MXINT8 data would toggle), which overstates it. Setting activity on the black-box pins had no effect. Neither number should be quoted. The fix in progress is to annotate activity from a gate-level simulation of a fused pass (VCD or SAIF read with `read_vcd`/`read_saif`) and report power again for both runs. Scripts: `openlane/pw.tcl`, `openlane/pw5.tcl`.
+The 3.4x jump is an artefact of vectorless activity, not a real cost. The SRAM data outputs are black boxes with activity 0, so in dupreg the whole datapath behind them looks idle (about 0.005 toggles per cycle), which understates power. In the speed run the datapath is driven from propagated flop sources instead (about 0.76 toggles per cycle, more than real MXINT8 data would toggle), which overstates it. Setting activity on the black-box pins had no effect. Neither number should be quoted. An RTL VCD annotated only 0.1% of the pins, because the flattened netlist's names differ from the RTL. A gate-level simulation of the routed `sram_p2_speed2` netlist annotated all of them: **70.3 mW during a fused pass (243 nJ, 67 GOPS/W)** and 43.2 mW averaged over a load, a pass and a decode step (`results/power_gl_sram_p2_speed2.md`). Scripts: `openlane/pw.tcl`, `openlane/pwv.tcl`, `tb/run_gl.py`, `tb/vcd_window.py`.
 
 ## Ablation on an edge-LLM attention layer
 
