@@ -10,7 +10,7 @@ unit. One controller runs attention two ways on the same hardware:
 
 A causal flag (CTRL bit 5) makes the fused pass causal, for prompt prefill in
 decoder models. Fused query groups are pipelined back to back
-(`docs/performance.md` (and `docs/comparison.md` for prior work)).
+(`docs/performance.md`; prior work in `docs/comparison.md`).
 
 A third mode, decode, is one KV-cache step of autoregressive generation: one
 query row attends to the LEN keys and values already held in SRAM.
