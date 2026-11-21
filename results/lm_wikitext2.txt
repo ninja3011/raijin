@@ -1,0 +1,13 @@
+char LM: 4 layers, d_model 128, 8 heads x 16, RoPE, context 32; 256 evenly spaced windows of the WikiText-2 test set (8192 predicted characters)
+FP32 attention                                 ppl=3.7133 (+0.00%) bpc=1.8927 top1=0.6125 zero-weight keys=0.0% l-wraps=0
+Raijin MXINT8, exact exp                       ppl=3.7157 (+0.06%) bpc=1.8936 top1=0.6127 zero-weight keys=16.7% l-wraps=0
+Raijin MXINT8, MF1 (one shift)                 ppl=3.7248 (+0.31%) bpc=1.8972 top1=0.6091 zero-weight keys=15.3% l-wraps=0
+Raijin MXINT8, MF2 (two shifts)                ppl=3.7147 (+0.04%) bpc=1.8933 top1=0.6128 zero-weight keys=16.0% l-wraps=0
+Raijin MXINT8, key skip SKIPTHR=6              ppl=3.7160 (+0.07%) bpc=1.8937 top1=0.6119 zero-weight keys=26.5% l-wraps=0
+Raijin MXINT8, key skip SKIPTHR=4              ppl=3.7209 (+0.20%) bpc=1.8956 top1=0.6105 zero-weight keys=39.3% l-wraps=0
+Raijin MXINT8, key skip SKIPTHR=2              ppl=3.7708 (+1.55%) bpc=1.9149 top1=0.6064 zero-weight keys=54.6% l-wraps=0
+Raijin K INT8, V INT4                          ppl=3.7296 (+0.44%) bpc=1.8990 top1=0.6112 zero-weight keys=16.6% l-wraps=0
+Raijin K INT4, V INT4                          ppl=3.8298 (+3.14%) bpc=1.9373 top1=0.6034 zero-weight keys=17.5% l-wraps=0
+Raijin INT4 + INT8 sink & worst page           ppl=3.7904 (+2.07%) bpc=1.9223 top1=0.6041 zero-weight keys=17.1% l-wraps=0
+Raijin K INT8, V INT4, SKIPTHR=6               ppl=3.7308 (+0.47%) bpc=1.8995 top1=0.6115 zero-weight keys=26.4% l-wraps=0
+Raijin operating point: MF2, K8 V4, SKIPTHR=6  ppl=3.7324 (+0.51%) bpc=1.9001 top1=0.6118 zero-weight keys=26.4% l-wraps=0

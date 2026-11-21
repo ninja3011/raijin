@@ -769,6 +769,28 @@ What this shows:
 - V is much more tolerant of INT4 than K: K8/V4 costs 0.65%, K4/V4 costs 3.9%. Keeping the sink page and the worst page in INT8 (feature 14) recovers 40% of the INT4 loss for the cost of two INT8 pages, so per-page precision is worth its hardware.
 - Recommended operating point for edge decode: MF2, SKIPTHR = 6, K INT8 / V INT4. Measured together, the cost is +0.85% perplexity for half the V storage and a quarter fewer V reads. (Rows other than the MF1/MF2 ones use the exact exponent, 4.6300, as their reference.)
 
+### Second benchmark: WikiText-2
+
+The same model, trained from scratch on the WikiText-2 training split (Merity et al. 2016, the tokenised release mirrored in pytorch/examples), modelled as characters and scored on 256 evenly spaced 32-character windows of the standard test split (`RAIJIN_LM_DATA=wikitext2 python3 eval/lm.py train|eval`, output `results/lm_wikitext2.txt`). FP32 reaches 1.893 bits per character.
+
+| Variant | Perplexity | Change | Bits per char | Keys with zero weight |
+|---|---|---|---|---|
+| FP32 attention | 3.7133 | baseline | 1.8927 | 0.0% |
+| MXINT8, exact exp2 | 3.7157 | +0.06% | 1.8936 | 16.7% |
+| MXINT8, MF1 | 3.7248 | +0.31% | 1.8972 | 15.3% |
+| MXINT8, MF2 | 3.7147 | +0.04% | 1.8933 | 16.0% |
+| Key skip, SKIPTHR = 6 | 3.7160 | +0.07% | 1.8937 | 26.5% |
+| Key skip, SKIPTHR = 4 | 3.7209 | +0.20% | 1.8956 | 39.3% |
+| Key skip, SKIPTHR = 2 | 3.7708 | +1.55% | 1.9149 | 54.6% |
+| K INT8, V INT4 | 3.7296 | +0.44% | 1.8990 | 16.6% |
+| K INT4, V INT4 | 3.8298 | +3.14% | 1.9373 | 17.5% |
+| INT4 with INT8 sink and worst page | 3.7904 | +2.07% | 1.9223 | 17.1% |
+| **Operating point: MF2, K8 V4, SKIPTHR = 6** | **3.7324** | **+0.51%** | 1.9001 | 26.4% |
+
+The ranking of every variant is the same as on Tiny Shakespeare, and every cost is a little smaller, so the conclusions above are not an artefact of one dataset.
+
+**Range of the softmax sum.** The l register is 13 bits (Q5.8), so it holds sums up to 31.99. Each key adds at most 1.0, so a pass over 32 or more keys with nearly flat attention could wrap it. The vector model counts every step where the 13-bit register would wrap: none occurred in either benchmark at context 32. Contexts beyond 31 keys in one pass (the 32-token INT4 cache with flat attention, or the scaling model's N = 512) need l widened to log2(N) + 8 bits. That is a parameter change in `raijin_softmax_lane.v` and the reciprocal, and it is listed as future work.
+
 ## Analytical scaling model
 
 `eval/scaling.py` is a cycle model of the controller written from the RTL's schedule (load, score, online-softmax, accumulate, drain, reciprocal, output). It is checked against every cycle count the testbench measured; output in `results/scaling.txt`.

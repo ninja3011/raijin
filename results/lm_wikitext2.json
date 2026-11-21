@@ -1,0 +1,110 @@
+[
+ {
+  "variant": "FP32 attention",
+  "loss": 1.3119298219680786,
+  "ppl": 3.713332873388942,
+  "acc": 0.612548828125,
+  "zero_p": 0.0,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin MXINT8, exact exp",
+  "loss": 1.3125752210617065,
+  "ppl": 3.715730228601991,
+  "acc": 0.6126708984375,
+  "zero_p": 0.16686526211825284,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin MXINT8, MF1 (one shift)",
+  "loss": 1.3150120973587036,
+  "ppl": 3.724796045172519,
+  "acc": 0.609130859375,
+  "zero_p": 0.15275596849846118,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin MXINT8, MF2 (two shifts)",
+  "loss": 1.3123054504394531,
+  "ppl": 3.714727968942279,
+  "acc": 0.61279296875,
+  "zero_p": 0.15972044973662405,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin MXINT8, key skip SKIPTHR=6",
+  "loss": 1.312639594078064,
+  "ppl": 3.7159694290637213,
+  "acc": 0.6119384765625,
+  "zero_p": 0.26454047000769415,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin MXINT8, key skip SKIPTHR=4",
+  "loss": 1.3139574527740479,
+  "ppl": 3.7208697799656236,
+  "acc": 0.6104736328125,
+  "zero_p": 0.39289370450106537,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin MXINT8, key skip SKIPTHR=2",
+  "loss": 1.327293038368225,
+  "ppl": 3.770822088763902,
+  "acc": 0.6064453125,
+  "zero_p": 0.5459997003728693,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin K INT8, V INT4",
+  "loss": 1.31631338596344,
+  "ppl": 3.7296462348849473,
+  "acc": 0.6112060546875,
+  "zero_p": 0.16620520389441287,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin K INT4, V INT4",
+  "loss": 1.3428221940994263,
+  "ppl": 3.829836810650018,
+  "acc": 0.6033935546875,
+  "zero_p": 0.17456725149443655,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin INT4 + INT8 sink & worst page",
+  "loss": 1.3324640989303589,
+  "ppl": 3.7903717408083715,
+  "acc": 0.6041259765625,
+  "zero_p": 0.1714405868992661,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin K INT8, V INT4, SKIPTHR=6",
+  "loss": 1.3166173696517944,
+  "ppl": 3.7307801588421468,
+  "acc": 0.6114501953125,
+  "zero_p": 0.2637784553296638,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ },
+ {
+  "variant": "Raijin operating point: MF2, K8 V4, SKIPTHR=6",
+  "loss": 1.31704580783844,
+  "ppl": 3.7323789099867395,
+  "acc": 0.61181640625,
+  "zero_p": 0.2638857292406487,
+  "acc_overflow": 0,
+  "l_overflow": 0
+ }
+]

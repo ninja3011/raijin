@@ -4,6 +4,12 @@ evaluation that swaps its attention for the bit-exact chip model.
 
   python3 eval/lm.py train      # trains on Tiny Shakespeare, saves eval/lm.pt
   python3 eval/lm.py eval       # perplexity for FP32 and every chip variant
+  RAIJIN_LM_DATA=wikitext2 python3 eval/lm.py train|eval
+                                # the same on WikiText-2 (raw characters, standard
+                                # train/test split), context 32, eval/lm_wt2.pt
+  WikiText-2 is not committed; fetch it with
+    for f in train valid test; do curl -fL --create-dirs -o eval/data/wikitext-2/$f.txt \
+      https://raw.githubusercontent.com/pytorch/examples/main/word_language_model/data/wikitext-2/$f.txt; done
 
 The chip variant runs exactly what Raijin does per generated token: Q (with
 log2(e)/sqrt(d) folded in), K and V are quantised to MXINT8 (or MXINT4), Q and
@@ -28,13 +34,25 @@ sys.path.insert(0, os.path.join(ROOT, "model"))
 import raijin_model as rm  # noqa: E402
 import raijin_vec as rv    # noqa: E402
 
-T, DH, NH, DM, NL = 32, 16, 8, 128, 4
+DATASET = os.environ.get("RAIJIN_LM_DATA", "shakespeare")
+DH, NH, DM, NL = 16, 8, 128, 4
 torch.manual_seed(0)
-TEXT = open(os.path.join(ROOT, "eval", "data", "tinyshakespeare.txt")).read()
+if DATASET == "wikitext2":
+    # WikiText-2 (Merity et al. 2016), tokenised release as mirrored in pytorch/examples;
+    # modelled as characters, trained on train.txt and scored on test.txt; context 32, since the 13-bit l register holds sums up to about 31 keys
+    T, CKPT, TAG = 32, "lm_wt2.pt", "lm_wikitext2"
+    _d = os.path.join(ROOT, "eval", "data", "wikitext-2")
+    _tr, _te = (open(os.path.join(_d, f + ".txt"), encoding="utf-8").read() for f in ("train", "test"))
+    TEXT = _tr + _te
+    SPLIT = len(_tr)
+else:
+    T, CKPT, TAG = 32, "lm.pt", "lm_perplexity"
+    TEXT = open(os.path.join(ROOT, "eval", "data", "tinyshakespeare.txt")).read()
+    SPLIT = None
 CHARS = sorted(set(TEXT))
 STOI = {c: i for i, c in enumerate(CHARS)}
 DATA = np.array([STOI[c] for c in TEXT], dtype=np.int64)
-SPLIT = int(0.9 * len(DATA))
+SPLIT = SPLIT if SPLIT is not None else int(0.9 * len(DATA))
 
 
 def rope(x):
@@ -88,7 +106,7 @@ class LM(nn.Module):
 
 def batch(split, n, rng):
     lo, hi = (0, SPLIT - T - 1) if split == "train" else (SPLIT, len(DATA) - T - 1)
-    ix = rng.integers(lo, hi, n)
+    ix = rng.integers(lo, hi, n) if split == "train" else np.linspace(lo, hi, n).astype(np.int64)
     x = np.stack([DATA[i:i + T] for i in ix])
     y = np.stack([DATA[i + 1:i + T + 1] for i in ix])
     return torch.from_numpy(x), torch.from_numpy(y)
@@ -111,7 +129,7 @@ def train(steps=4000):
         sched.step()
         if it % 500 == 0 or it == steps - 1:
             print(f"step {it} loss {loss.item():.3f} ({time.time() - t0:.0f} s)", flush=True)
-    torch.save(model.state_dict(), os.path.join(ROOT, "eval", "lm.pt"))
+    torch.save(model.state_dict(), os.path.join(ROOT, "eval", CKPT))
     n = sum(p.numel() for p in model.parameters())
     print(f"saved, {n} parameters")
 
@@ -178,7 +196,7 @@ def sink_and_worst(k, ki, ek):
 def evaluate(n_seq=256):
     torch.set_num_threads(os.cpu_count())
     model = LM()
-    model.load_state_dict(torch.load(os.path.join(ROOT, "eval", "lm.pt")))
+    model.load_state_dict(torch.load(os.path.join(ROOT, "eval", CKPT)))
     model.eval()
     rng = np.random.default_rng(123)
     x, y = batch("val", n_seq, rng)
@@ -208,18 +226,22 @@ def evaluate(n_seq=256):
             acc = (logits.argmax(-1) == y).float().mean().item()
             row = dict(variant=name, loss=loss, ppl=math.exp(loss), acc=acc,
                        zero_p=stats.get("zero_p", 0) / max(stats.get("pairs", 1), 1),
-                       acc_overflow=stats.get("acc_overflow", 0))
+                       acc_overflow=stats.get("acc_overflow", 0),
+                       l_overflow=stats.get("l_overflow", 0))
             res.append(row)
             print(f"{name:40s} ppl={row['ppl']:.4f} loss={loss:.4f} top1={acc:.4f} "
                   f"zero-weight keys={100 * row['zero_p']:.1f}% ({time.time() - t0:.0f} s)", flush=True)
     base = res[0]["ppl"]
-    with open(os.path.join(ROOT, "results", "lm_perplexity.txt"), "w") as f:
+    where = ("evenly spaced windows of the WikiText-2 test set" if DATASET == "wikitext2"
+             else "validation sequences of Tiny Shakespeare")
+    with open(os.path.join(ROOT, "results", TAG + ".txt"), "w") as f:
         f.write(f"char LM: {NL} layers, d_model {DM}, {NH} heads x {DH}, RoPE, context {T}; "
-                f"{n_seq} validation sequences of Tiny Shakespeare ({n_seq * T} predicted characters)\n")
+                f"{n_seq} {where} ({n_seq * T} predicted characters)\n")
         for r in res:
-            f.write(f"{r['variant']:40s} ppl={r['ppl']:.4f} ({100 * (r['ppl'] / base - 1):+.2f}%) "
-                    f"top1={r['acc']:.4f} zero-weight keys={100 * r['zero_p']:.1f}%\n")
-    with open(os.path.join(ROOT, "results", "lm_perplexity.json"), "w") as f:
+            f.write(f"{r['variant']:46s} ppl={r['ppl']:.4f} ({100 * (r['ppl'] / base - 1):+.2f}%) "
+                    f"bpc={r['loss'] / math.log(2):.4f} top1={r['acc']:.4f} "
+                    f"zero-weight keys={100 * r['zero_p']:.1f}% l-wraps={r['l_overflow']}\n")
+    with open(os.path.join(ROOT, "results", TAG + ".json"), "w") as f:
         json.dump(res, f, indent=1)
 
 

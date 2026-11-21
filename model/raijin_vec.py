@@ -71,6 +71,7 @@ def decode_causal(q, eq, k, ek, v, ev, mode=rm.MODE_EXACT, thr=0, offset=0, stat
     acc = np.zeros(lead + (T, D), dtype=np.int64)
     qi = np.arange(T)
     zeros = 0
+    lwrap = 0
     for j in range(T):
         live = qi >= j                                     # queries that see key j
         s = S[..., :, j]
@@ -81,13 +82,16 @@ def decode_causal(q, eq, k, ek, v, ev, mode=rm.MODE_EXACT, thr=0, offset=0, stat
         use = live & (p != 0)
         zeros += int(np.sum(live & (p == 0)))
         dsh = np.minimum(delta, 31)
-        l = np.where(use, ((l >> dsh) + p) & 0x1FFF, l)
+        lraw = (l >> dsh) + p
+        lwrap += int(np.sum(use & (lraw >= (1 << 13))))  # the 13-bit l register would wrap
+        l = np.where(use, lraw & 0x1FFF, l)
         dv = np.minimum(emax - ev[..., j:j + 1], 31)       # (..., T)
         term = (p[..., None] * v[..., None, j, :]) >> dv[..., None]
         acc = np.where(use[..., None], (acc >> dsh[..., None]) + term, acc)
     if stats is not None:
         stats["zero_p"] = stats.get("zero_p", 0) + zeros
         stats["pairs"] = stats.get("pairs", 0) + int(np.prod(lead)) * T * (T + 1) // 2
+        stats["l_overflow"] = stats.get("l_overflow", 0) + lwrap
         stats["acc_overflow"] = stats.get("acc_overflow", 0) + int(np.sum((acc < -(1 << 23)) | (acc >= (1 << 23))))
     r = (1 << 19) // np.maximum(l, 1)
     y = acc * r[..., None]
