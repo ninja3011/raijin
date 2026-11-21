@@ -199,6 +199,49 @@ def attention(q, eq, k, ek, v, ev, *, fused: bool, mode: int = MODE_EXACT,
     return PassResult(o=o, eo=eo, skips=skips, l=ls, scores=scores)
 
 
+def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
+                     mode: int = MODE_EXACT, offset: int = 0) -> PassResult:
+    """One KV-cache decode step: query row `qrow` attends to keys 0..length-1.
+
+    This is the fused (online softmax) pass for one query over a key prefix.
+    e_vmax is taken over the cached V rows only, as in the RTL. The result
+    holds a single output row.
+    """
+    q, k, v = (np.asarray(a, dtype=np.int64) for a in (q, k, v))
+    eq, ek, ev = (np.asarray(a, dtype=np.int64) for a in (eq, ek, ev))
+    d = q.shape[1]
+    emax = int(ev[:length].max())
+    s = [requant(dpu(q[qrow], k[j]), int(eq[qrow]) + int(ek[j]), offset) for j in range(length)]
+    acc = [0] * d
+    lsum, m, skips = 0, M_INIT, 0
+    for j in range(length):
+        mn = max(m, ceil_int(s[j]))
+        delta = mn - m
+        m = mn
+        p, _, _ = exp2(s[j], m, mode)
+        if p == 0:
+            skips += 1
+            continue
+        dsh = min(delta, 31)
+        lsum = (lsum >> dsh) + p
+        dv = emax - int(ev[j])
+        for c in range(d):
+            acc[c] = _sra(acc[c], dsh) + pv_term(p, v[j][c], dv)
+    row, e = out_row(acc, recip(lsum), emax)
+    return PassResult(o=np.array([row], dtype=np.int64), eo=np.array([e], dtype=np.int64),
+                      skips=skips, l=[lsum])
+
+
+def _check_decode_matches_fused(rng) -> None:
+    """With length = N, decode of row i must equal row i of the fused pass."""
+    qf, kf, vf = random_case(rng, scale=1.5)
+    args = prepare(qf, kf, vf)
+    full = attention(*args, fused=True)
+    for i in range(qf.shape[0]):
+        r = attention_decode(*args, qrow=i, length=qf.shape[0])
+        assert np.array_equal(r.o[0], full.o[i]) and r.eo[0] == full.eo[i], i
+
+
 # ---------------------------------------------------------------------------
 # Quantisation helpers (host side)
 # ---------------------------------------------------------------------------
@@ -244,6 +287,17 @@ def reference(qf, kf, vf):
     return p @ vf
 
 
+def reference_causal(qf, kf, vf):
+    """FP32 causal attention: row i sees keys 0..i (what decode computes)."""
+    n = qf.shape[0]
+    s = qf @ kf.T / np.sqrt(qf.shape[1])
+    s = np.where(np.tril(np.ones((n, n), dtype=bool)), s, -np.inf)
+    s = s - s.max(axis=1, keepdims=True)
+    p = np.exp(s)
+    p /= p.sum(axis=1, keepdims=True)
+    return p @ vf
+
+
 def random_case(rng: np.random.Generator, n=16, d=16, scale=1.0, outliers=False):
     qf = rng.standard_normal((n, d)) * scale
     kf = rng.standard_normal((n, d)) * scale
@@ -267,3 +321,5 @@ if __name__ == "__main__":
                 ref = reference(qf, kf, vf)
                 cos.append(np.sum(got * ref) / np.linalg.norm(got) / np.linalg.norm(ref))
             print(f"fused={fused!s:5} mode={mode} mean cos={np.mean(cos):.5f} min={np.min(cos):.5f}")
+    _check_decode_matches_fused(rng)
+    print("decode with length N matches the fused pass row by row")

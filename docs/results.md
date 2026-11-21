@@ -1,5 +1,9 @@
 # Raijin results
 
+> The SRAM rework (Q/K/V/O and the score buffer in four sky130 SRAM macros,
+> registered bus, KV-cache decode mode) is described with its layout numbers in
+> `docs/sram_kv.md`. The tables below are for the original flip-flop design.
+
 All numbers are for N = d = 16, one head, MXINT8 inputs, 50 MHz target.
 
 ## Cycles per attention pass (RTL simulation, measured by the CYCLES counter)

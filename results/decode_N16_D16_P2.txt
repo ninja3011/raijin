@@ -1,0 +1,9 @@
+decode random   mode=0 len= 1 cycles=  33 cos=0.99996
+decode random   mode=0 len= 8 cycles=  40 cos=0.99990
+decode random   mode=0 len=16 cycles=  48 cos=0.99991
+decode sharp    mode=2 len= 1 cycles=  33 cos=0.99999
+decode sharp    mode=2 len= 8 cycles=  40 cos=0.99998
+decode sharp    mode=2 len=16 cycles=  48 cos=0.99984
+decode outliers mode=0 len= 1 cycles=  33 cos=0.99998
+decode outliers mode=0 len= 8 cycles=  40 cos=0.99996
+decode outliers mode=0 len=16 cycles=  48 cos=0.99996

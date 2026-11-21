@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Summarise a LibreLane run into results/openlane_summary.md.
 
-Usage: python3 scripts/openlane_summary.py openlane/runs/<tag>
+Usage: python3 scripts/openlane_summary.py openlane/runs/<tag> [output.md]
 """
 import json
 import os
@@ -10,7 +10,9 @@ import sys
 KEYS = [
     ("design__die__bbox", "Die bounding box (µm)"),
     ("design__core__area", "Core area (µm²)"),
-    ("design__instance__area", "Standard-cell area (µm²)"),
+    ("design__instance__area", "Instance area, cells + macros (µm²)"),
+    ("design__instance__area__stdcell", "Standard-cell area (µm²)"),
+    ("design__instance__area__macros", "SRAM macro area (µm²)"),
     ("design__instance__count", "Cell instances"),
     ("design__instance__count__stdcell", "Standard cells"),
     ("design__instance__utilization", "Core utilization"),
@@ -36,7 +38,7 @@ KEYS = [
 ]
 
 
-def main(run):
+def main(run, dst="results/openlane_summary.md"):
     path = os.path.join(run, "final", "metrics.json")
     if not os.path.exists(path):
         # flow still running: use the latest step's state
@@ -65,10 +67,10 @@ def main(run):
         lines += ["", f"Estimated fmax at the typical corner: {fmax:.1f} MHz (1 / (20 ns - WS))."]
     out = "\n".join(lines) + "\n"
     os.makedirs("results", exist_ok=True)
-    with open("results/openlane_summary.md", "w") as f:
+    with open(dst, "w") as f:
         f.write(out)
     print(out)
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main(*sys.argv[1:3])
