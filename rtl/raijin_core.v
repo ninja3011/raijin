@@ -736,16 +736,20 @@ module raijin_core #(
                     orow <= orow + 1'b1;
                     if (decode || orow == P - 1) begin
                         if (decode || last_g) begin
-                            dcnt  <= 4'd4;
+                            dcnt  <= 4'd6;
                             state <= OUT_DRAIN;
                         end else begin
                             g     <= g + 1'b1;
+                            dcnt  <= 4'd2;
                             state <= OUT_WAIT;
                         end
                     end
                 end
-                // one cycle so the last O write (port 0) lands before the next V read
-                OUT_WAIT: state <= fused ? F_CLR : U_PV_CLR;
+                // three cycles so the last O write (port 0) lands before the next V read
+                OUT_WAIT: begin
+                    dcnt <= dcnt - 1'b1;
+                    if (dcnt == 0) state <= fused ? F_CLR : U_PV_CLR;
+                end
                 OUT_DRAIN: begin
                     dcnt <= dcnt - 1'b1;
                     if (dcnt == 0) state <= S_DONE;

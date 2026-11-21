@@ -120,7 +120,7 @@ async def test_out_random(dut):
         emax = rnd.randint(0, 255)
         vecs.append((acc, r, emax))
     got = []
-    for idx in range(len(vecs) + 4):
+    for idx in range(len(vecs) + 8):
         if idx < len(vecs):
             acc, r, emax = vecs[idx]
             dut.acc.value = pack(acc, 24)

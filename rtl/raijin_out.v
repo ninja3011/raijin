@@ -1,8 +1,10 @@
 // Raijin output stage: per-row requant by 1/l and MXINT8 packing.
-//   y[c]  = acc[c] * r                         (stage 1)
+//   y[c]  = acc[c] * r                         (stages 1a, 1b: split multiply)
 //   sh    = max(0, bitlen(OR_c |y[c]|') - 7)   (stage 2, leading-one detect)
-//   o[c]  = sat8((y[c] + 2^(sh-1)) >>> sh)     (stage 3)
+//   o[c]  = sat8((y[c] + 2^(sh-1)) >>> sh)     (stage 3a round and shift, 3b saturate)
 //   e_o   = clamp(e_vmax + sh - 19, 0, 255)
+// Latency: out_valid five edges after in_valid. The 24 x 13 multiply is split
+// into r[6:0] and r[12:7] halves so neither stage carries a full-width carry chain.
 `default_nettype none
 module raijin_out #(
     parameter D  = 16,
@@ -20,25 +22,45 @@ module raijin_out #(
     output reg  [D*8-1:0]    o,
     output reg  [7:0]        eo
 );
-    // ---------------- stage 1 ----------------
+    // one loop variable per always block, so synthesis never infers a register for it
+    integer c0, c1, c2, c3, c4;
+
+    // ---------------- stage 1a: partial products ----------------
+    reg signed [31:0] plo [0:D-1];      // acc * r[6:0]
+    reg signed [30:0] phi [0:D-1];      // acc * r[12:7]
+    reg               v0;
+    reg [TW-1:0]      tag0;
+    reg [7:0]         em0;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) v0 <= 1'b0;
+        else        v0 <= in_valid;
+    end
+    always @(posedge clk) begin
+        tag0 <= in_tag;
+        em0  <= emax;
+        for (c0 = 0; c0 < D; c0 = c0 + 1) begin
+            plo[c0] <= $signed(acc[c0*24 +: 24]) * $signed({1'b0, r[6:0]});
+            phi[c0] <= $signed(acc[c0*24 +: 24]) * $signed({1'b0, r[12:7]});
+        end
+    end
+
+    // ---------------- stage 1b: y = plo + phi << 7 ----------------
     reg signed [37:0] y1 [0:D-1];
     reg               v1;
     reg [TW-1:0]      tag1;
     reg [7:0]         em1, em2;
-    // one loop variable per always block, so synthesis never infers a register for it
-    integer c1, c2, c3, c4;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) v1 <= 1'b0;
-        else        v1 <= in_valid;
+        else        v1 <= v0;
     end
     always @(posedge clk) begin
-        tag1 <= in_tag;
-        em1  <= emax;
+        tag1 <= tag0;
+        em1  <= em0;
         for (c1 = 0; c1 < D; c1 = c1 + 1)
-            y1[c1] <= $signed(acc[c1*24 +: 24]) * $signed({1'b0, r});
+            y1[c1] <= $signed({{6{plo[c1][31]}}, plo[c1]}) + ($signed({{7{phi[c1][30]}}, phi[c1]}) <<< 7);
     end
 
-    // ---------------- stage 2 ----------------
+    // ---------------- stage 2: leading-one detect ----------------
     reg [37:0] orv;
     reg [5:0]  nb;
     integer b;
@@ -66,27 +88,42 @@ module raijin_out #(
         for (c3 = 0; c3 < D; c3 = c3 + 1) y2[c3] <= y1[c3];
     end
 
-    // ---------------- stage 3 ----------------
-    reg signed [38:0] rnd;
-    reg [D*8-1:0]     o_n;
-    wire [9:0]        eo_w = {2'b00, em2} + {4'd0, sh2};
-    always @(*) begin
+    // ---------------- stage 3a: round and shift ----------------
+    reg signed [38:0] r3 [0:D-1];
+    reg               v3;
+    reg [TW-1:0]      tag3;
+    reg [9:0]         eo3;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) v3 <= 1'b0;
+        else        v3 <= v2;
+    end
+    always @(posedge clk) begin
+        tag3 <= tag2;
+        eo3  <= {2'b00, em2} + {4'd0, sh2};
         for (c4 = 0; c4 < D; c4 = c4 + 1) begin
-            if (sh2 == 6'd0) rnd = {y2[c4][37], y2[c4]};
-            else             rnd = ($signed({y2[c4][37], y2[c4]}) + (39'sd1 <<< (sh2 - 6'd1))) >>> sh2;
-            if (rnd > 39'sd127)       o_n[c4*8 +: 8] = 8'sd127;
-            else if (rnd < -39'sd128) o_n[c4*8 +: 8] = -8'sd128;
-            else                      o_n[c4*8 +: 8] = rnd[7:0];
+            if (sh2 == 6'd0) r3[c4] <= {y2[c4][37], y2[c4]};
+            else             r3[c4] <= ($signed({y2[c4][37], y2[c4]}) + (39'sd1 <<< (sh2 - 6'd1))) >>> sh2;
+        end
+    end
+
+    // ---------------- stage 3b: saturate and pack ----------------
+    reg [D*8-1:0] o_n;
+    integer c5;
+    always @(*) begin
+        for (c5 = 0; c5 < D; c5 = c5 + 1) begin
+            if (r3[c5] > 39'sd127)       o_n[c5*8 +: 8] = 8'sd127;
+            else if (r3[c5] < -39'sd128) o_n[c5*8 +: 8] = -8'sd128;
+            else                         o_n[c5*8 +: 8] = r3[c5][7:0];
         end
     end
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) out_valid <= 1'b0;
-        else        out_valid <= v2;
+        else        out_valid <= v3;
     end
     always @(posedge clk) begin
-        out_tag <= tag2;
+        out_tag <= tag3;
         o       <= o_n;
-        eo      <= (eo_w < 10'd19) ? 8'd0 : ((eo_w - 10'd19) > 10'd255 ? 8'd255 : (eo_w - 10'd19));
+        eo      <= (eo3 < 10'd19) ? 8'd0 : ((eo3 - 10'd19) > 10'd255 ? 8'd255 : (eo3 - 10'd19));
     end
 endmodule
 `default_nettype wire
