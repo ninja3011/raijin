@@ -218,3 +218,33 @@ async def test_qspi_passes(dut):
     summary = await run_passes(dut, quad=True)
     with open(os.path.join(os.path.dirname(__file__), "..", "results", f"chip_qspi_N{N}_D{D}.txt"), "w") as f:
         f.write(chr(10).join(summary) + chr(10))
+
+
+@cocotb.test()
+async def test_qspi_token_window(dut):
+    """Decode over QSPI with the token window: per token one 55-byte write
+    transaction (header + Q/K/V/exponents/CTRL) and one 21-byte read. Bit-exact;
+    records bus time per token against the per-register loop."""
+    spi = await setup(dut)
+    rng = np.random.default_rng(int(os.environ.get("RAIJIN_SEED", 7)) + 61)
+    qf, kf, vf = rm.random_case(rng, n=N, d=D, scale=1.5)
+    q, eq, k, ek, v, ev = rm.prepare(qf, kf, vf)
+    lines = []
+    for quad in (False, True):
+        spi.quad = quad
+        await spi.write(0x5010, 0)
+        spi.bytes, spi.ns = 0, 0
+        for t in range(N):
+            await spi.write(0x5011, t)
+            await spi.write(0x6000, list(q[t]) + list(k[t]) + list(v[t]) + [eq[t], ek[t], ev[t], 1 | (1 << 4)])
+            await wait_done(dut)
+            out = await spi.read(0x6000, D + 1)
+            o = np.array([x - 256 if x & 0x80 else x for x in out[:D]])
+            exp = rm.attention_decode(q, eq, k, ek, v, ev, qrow=t, length=t + 1)
+            assert np.array_equal(o, exp.o[0]) and out[D] == exp.eo[0], f"token window quad={quad} t={t}"
+        per_tok_us = spi.ns / N / 1000
+        lines.append(f"{'qspi' if quad else 'spi'} token window: {spi.bytes / N:.0f} bytes and {per_tok_us:.1f} us "
+                     f"of bus time per token (host-limited {1e6 / per_tok_us:,.0f} tokens/s)")
+        dut._log.info(lines[-1])
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", f"chip_token_window_N{N}_D{D}.txt"), "w") as f:
+        f.write(chr(10).join(lines) + chr(10))

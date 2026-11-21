@@ -668,3 +668,57 @@ async def test_paged_kv_cache(dut):
     await write_ptab(bus, list(range(2 * N // 4)))
     with open(os.path.join(os.path.dirname(__file__), "..", "results", f"paged_N{N}_D{D}.txt"), "w") as f:
         f.write(chr(10).join(summary) + chr(10))
+
+
+@cocotb.test()
+async def test_token_window(dut):
+    """Token window (region 6): each decode token is one 52-byte write burst
+    (Q, K, V rows, three exponents, CTRL with auto LEN + 1) and one 17-byte
+    read burst (O row and e_o). Plain, then paged with a shuffled page order
+    and RoPE at absolute positions, every step bit-exact."""
+    bus = await setup(dut)
+    rng = np.random.default_rng(int(os.environ.get("RAIJIN_SEED", 7)) + 71)
+    summary = []
+    for variant in ("plain", "paged+rope"):
+        qf, kf, vf = rm.random_case(rng, n=N, d=D, scale=1.5)
+        q, eq, k, ek, v, ev = rm.prepare(qf, kf, vf)
+        paged = variant != "plain"
+        perm = [int(x) for x in rng.permutation(N // 4)] if paged else list(range(2 * N // 4))
+        base = 50
+        if paged:
+            await write_ptab(bus, perm)
+            await bus.write(0x501A, 1)
+            qm, eqm = rm.rope_quantized(q, eq, [base + t for t in range(N)])
+            km, ekm = rm.rope_quantized(k, ek, [base + t for t in range(N)])
+        else:
+            qm, eqm, km, ekm = q, eq, k, ek
+        await bus.write(0x5010, 0)
+        coss = []
+        for t in range(N):
+            qr = t
+            await bus.write(0x5011, qr)
+            if paged:
+                await bus.write(0x5018, 3)
+                await bus.write(0x5019, base + t)
+            burst = list(q[t]) + list(k[t]) + list(v[t]) + [eq[t], ek[t], ev[t], 1 | (1 << 4)]
+            for b, val in enumerate(burst):
+                await bus.write(0x6000 + b, int(val))
+            await wait_done(dut)
+            out = [await bus.read(0x6000 + b) for b in range(D + 1)]
+            o = np.array([x - 256 if x & 0x80 else x for x in out[:D]])
+            assert await bus.read(0x5010) == t + 1
+            exp = rm.attention_decode(qm, eqm, km, ekm, v, ev, qrow=t, length=t + 1)
+            assert np.array_equal(o, exp.o[0]) and out[D] == exp.eo[0], \
+                f"{variant} t={t}: rtl={o} e={out[D]} model={exp.o[0]} e={exp.eo[0]}"
+            ref = (rm.reference_causal(rm.rope_float(qf, [base + i for i in range(N)]),
+                                       rm.rope_float(kf, [base + i for i in range(N)]), vf)
+                   if paged else rm.reference_causal(qf, kf, vf))[t]
+            got = rm.mx_dequantize(o[None, :], np.array([out[D]]))[0]
+            coss.append(float(np.dot(got, ref) / np.linalg.norm(got) / np.linalg.norm(ref)))
+        summary.append(f"token window {variant}: {N} tokens, 52 + 17 bytes per token, mean cos={np.mean(coss):.5f}")
+        dut._log.info(summary[-1])
+        await bus.write(0x5018, 0)
+        await bus.write(0x501A, 0)
+        await write_ptab(bus, list(range(2 * N // 4)))
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", f"token_window_N{N}_D{D}.txt"), "w") as f:
+        f.write(chr(10).join(summary) + chr(10))

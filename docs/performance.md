@@ -65,6 +65,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 | 10 | Paged KV cache (PAGED 0x501A, PTAB 0x501C..F) | RTL merged | No cycle cost: the page table sits on the K and V read addresses. Two sequences share one cache and one prompt page, and a 32-token INT4 cache is scattered over a shuffled page order. Every decode step is bit-exact with decode on the gathered logical sequence |
 | 11 | Chip top: SPI host port and idle clock gating (`rtl/raijin_spi.v`, `rtl/raijin_chip.v`) | RTL merged; layout config added, not yet run | The whole register and memory map is reachable through 4 SPI pins. Passes over SPI are bit-exact. During a decode loop with 200-cycle idle gaps between tokens, the core clock is off **90.8%** of the time. SPI bandwidth (0.78 MB/s), not compute, now limits the end-to-end token rate |
 | 12 | QSPI host port (0x32 quad write, 0x6B quad read, io[3:0]) | RTL merged | A full Q/K/V load drops from 1,069 µs to **286 µs** (3.7×). Bus time per decode token drops from 135 µs to **66.9 µs**, so the host-limited rate goes from 7,400 to about **15,000 tokens/s**. Plain SPI hosts still work |
+| 13 | Token window (region 0x6000): one write burst and one read burst per decode token | RTL merged | Bus time per decode token over QSPI 66.9 → **36.2 µs**, about **27,700 tokens/s** host-limited: 3.7× the single-lane SPI baseline of feature 11. Works with paging and RoPE |
 
 ### 1. Timing closure
 
@@ -617,4 +618,56 @@ exactly the same 10,296 cycles in both cases.
 `test_spi_registers` checks quad and single-lane bursts against each other.
 `test_qspi_passes` repeats the fused, causal, unfused and decode checks of
 feature 11 over QSPI. All of it is bit-exact.
+
+### 13. Token window: one burst per decode token
+
+After QSPI, a decode token still costs 10 bus transactions: three rows, three
+exponents, LEN and QROW, CTRL, the O row and e_o. Each one pays 3 or 4
+single-lane header bytes. The token window in region 6 packs the whole token
+into one write and one read:
+
+| Write 0x6000 + b | Goes to |
+| --- | --- |
+| b = 0..15 | Q[QROW][b] |
+| b = 16..31 | K[tok][b − 16] |
+| b = 32..47 | V[tok][b − 32] |
+| b = 48, 49, 50 | e_q[QROW], e_k[tok], e_v[tok] |
+| b = 51 | CTRL: LEN ← LEN + 1, then start the pass with this value |
+
+| Read 0x6000 + b | Comes from |
+| --- | --- |
+| b = 0..15 | O[QROW][b] |
+| b = 16 | e_o[QROW] |
+
+`tok` is the next cache slot, LEN, mapped through PTAB when PAGED is set. So
+the host just streams tokens; the chip tracks where each one goes. Each
+window byte is translated, in the bus decode, to the ordinary address it
+stands for. RoPE on write, paging and the busy rules therefore apply with no
+other change. The cost is the address mux, about a hundred cells
+(*estimate*). The window is INT8 only; MXINT4 tokens use the normal packed
+writes.
+
+**Verification.**
+- `test_token_window` (core) runs 16 decode tokens through the window, then
+  repeats them with a shuffled page table and RoPE at absolute positions
+  50..65. Every step is bit-exact with the model. Mean cosine against FP32
+  is 0.99987 plain and 0.99946 paged with RoPE.
+- `test_qspi_token_window` (chip) runs the same loop over the pins.
+
+**Measured over the chip pins** (P = 4, SCK = 6.25 MHz,
+`results/chip_token_window_N16_D16.txt`). Per token that is one QROW write,
+one 55-byte window write and one 21-byte window read: 80 bytes.
+
+| Per decode token | Bytes | Bus time | Host-limited rate |
+| --- | --- | --- | --- |
+| SPI, register by register (feature 11) | 103 | 135 µs | 7,400 tokens/s |
+| QSPI, register by register (feature 12) | 103 | 66.9 µs | 15,000 tokens/s |
+| SPI, token window | 80 | 103 µs | 9,700 tokens/s |
+| **QSPI, token window** | 80 | **36.2 µs** | **27,700 tokens/s** |
+
+The single-lane command, address and dummy bytes are now the largest
+remaining overhead. They are 10 of the 80 bytes, but take over a third of the
+QSPI time, because they run at one bit per clock. Making
+QROW auto-increment as well, or a fully quad command phase (QPI), would remove
+most of the rest.
 

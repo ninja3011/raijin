@@ -1,0 +1,2 @@
+spi token window: 80 bytes and 103.4 us of bus time per token (host-limited 9,675 tokens/s)
+qspi token window: 80 bytes and 36.2 us of bus time per token (host-limited 27,655 tokens/s)

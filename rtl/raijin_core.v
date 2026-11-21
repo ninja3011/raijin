@@ -80,6 +80,7 @@
 //                  low nibble of byte b: logical page -> physical page. Logical
 //                  token j lives in physical token PTAB[j/4]*4 + j%4 (its K/V
 //                  row and its e_k / e_v). Resets to the identity map.
+//   0x6000.. token window (decode): see the bus decode below
 //   e_k / e_v exponents: 0x41tt / 0x42tt for tokens t = 0..2N-1
 `default_nettype none
 `ifdef RAIJIN_SKY130_SRAM
@@ -192,8 +193,38 @@ module raijin_core #(
     // ------------------------------------------------------------------
     // Bus decode
     // ------------------------------------------------------------------
-    wire [3:0]    region = addr_r[15:12];
-    wire [11:0]   boff   = addr_r[11:0];
+    // Token window (region 6, feature 13): one burst per decode token.
+    //   write 0x6000 + b:  b 0..15 Q[QROW], 16..31 K[tok], 32..47 V[tok],
+    //                      48 e_q[QROW], 49 e_k[tok], 50 e_v[tok],
+    //                      51 CTRL: LEN <= LEN + 1, then start with this value
+    //   read  0x6000 + b:  b 0..15 O[QROW], 16 e_o[QROW]
+    // tok is the next cache slot, LEN (through PTAB when PAGED is set).
+    // INT8 K/V only. Each byte is translated to its ordinary address, so RoPE,
+    // paging and the busy rules apply unchanged.
+    wire          twin    = (addr_r[15:12] == 4'h6);
+    wire [5:0]    tb      = addr_r[5:0];
+    wire [LK-1:0] ttok_l  = len[LK-1:0];
+    wire [LK-1:0] ttok    = paged ? {ptab[ttok_l[LK-1:LPG]], ttok_l[LPG-1:0]} : ttok_l;
+    wire [LN-1:0] ttrow   = ttok[LN-1:0];
+    reg  [15:0]   baddr;
+    always @(*) begin
+        baddr = addr_r;
+        if (twin) begin
+            if (re_r && !we_r)
+                baddr = (tb < 6'd16) ? {4'h3, {(12-LN-LD){1'b0}}, qrow, tb[LD-1:0]}
+                                     : {8'h43, {(8-LN){1'b0}}, qrow};
+            else if (tb < 6'd16) baddr = {4'h0, {(12-LN-LD){1'b0}}, qrow,  tb[LD-1:0]};
+            else if (tb < 6'd32) baddr = {4'h1, {(12-LN-LD){1'b0}}, ttrow, tb[LD-1:0]};
+            else if (tb < 6'd48) baddr = {4'h2, {(12-LN-LD){1'b0}}, ttrow, tb[LD-1:0]};
+            else if (tb == 6'd48) baddr = {8'h40, {(8-LN){1'b0}}, qrow};
+            else if (tb == 6'd49) baddr = {8'h41, {(8-LK){1'b0}}, ttok};
+            else if (tb == 6'd50) baddr = {8'h42, {(8-LK){1'b0}}, ttok};
+            else                  baddr = 16'h5000;
+        end
+    end
+    wire          tw_go  = we_r && twin && tb == 6'd51 && !busy_r;   // LEN + 1 and start
+    wire [3:0]    region = baddr[15:12];
+    wire [11:0]   boff   = baddr[11:0];
     wire [LN-1:0] brow   = boff[LD +: LN];
     wire [LD-1:0] bcol   = boff[LD-1:0];
     wire [1:0]    bbank  = bcol[3:2];
@@ -865,7 +896,8 @@ module raijin_core #(
             else if (since_last != 5'd31)                         since_last <= since_last + 1'b1;
             if (we_r && creg && !busy_r) begin
                 if (cidx == 5'h01) offset <= wdata_r;
-                if (cidx == 5'h10) len    <= wdata_r[LK:0];
+                if (cidx == 5'h10 && !twin) len <= wdata_r[LK:0];
+                if (tw_go)                  len <= len + 1'b1;
                 if (cidx == 5'h13) thr <= wdata_r[3:0];
                 if (cidx == 5'h18) begin
                     rope_en  <= wdata_r[0];
