@@ -69,7 +69,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 | 14 | Per-page mixed KV precision (PAGED bit 1, PFMT 0x501B) | RTL merged | 24 tokens in the 16-word cache: 2 INT8 pages + 4 INT4 pages. On sharp attention, mean decode cosine 0.9656 (all INT4) → **0.9914** with INT8 for the sink page and the worst-error page. No cycle cost |
 | 15 | Heavy-hitter tracker for KV eviction (region 0x7000, `rtl/raijin_hh.v`) | RTL merged | Per-slot accumulators of attention weight and an on-chip argmin (HHMIN) give the host its H2O eviction victim with one byte read, also in the token window. Decode step 50 → **62** cycles at LEN = 16 with the tracker on, unchanged when off. Bit-exact with the model. On the char LMs, chip H2O matches FP H2O within 0.25% and beats a sliding window at budget 16 (4.608 vs 4.633), but loses at budget 8 |
 | 16 | MXFP4 KV elements (KVFMT bits 2, 3: E2M1 nibbles) | RTL merged | Same storage and cycles as MXINT4; a 16-entry nibble decoder in front of the shared INT8 datapath. Bit-exact in full passes, 2N-token decode and mixed paging. Row RMS error 0.128 → **0.109**; with K and V both 4-bit, char-LM cost +3.33% → **+2.61%** (Tiny Shakespeare) and +2.96% → **+2.71%** (WikiText-2). V-only is a wash |
-| 17 | Max-first decode (SKIPTHR bit 7) | RTL merged | Pass A scores all cached keys and finds the true maximum; pass B visits only keys with nonzero weight. In the char LMs the share of keys needing a V read drops from 86% to **36%** (Tiny Shakespeare) and 84% to **31%** (WikiText-2), for +0.06% and +0.05% perplexity. Bit-exact. Decode at LEN = 16 takes 57 to 70 cycles instead of 50 (it is bus-limited anyway) |
+| 17 | Max-first decode (SKIPTHR bit 7) | RTL merged | Pass A scores all cached keys and finds the true maximum; pass B visits only keys with nonzero weight. In the char LMs the share of keys needing a V read drops from 86% to **36%** (Tiny Shakespeare) and 84% to **31%** (WikiText-2), for +0.06% and +0.05% perplexity. Bit-exact. Decode at LEN = 16 takes 58 to 71 cycles instead of 50 (it is bus-limited anyway) |
 
 ### 1. Timing closure
 
@@ -918,13 +918,16 @@ passes:
   read and accumulated as in a fused step. Unmarked keys cost neither a V read
   nor a cycle.
 
-SKIPS and VSKIPS count the keys pass B never visits. The heavy-hitter tracker
+SKIPS and VSKIPS count the keys pass B never visits. For timing, the
+query lane is a registered one-hot select in three local copies, and the final
+m is registered before the 32 comparators (first layout with this feature:
+the die-wide qlane net cost 3.6 ns of typical-corner slack). The heavy-hitter tracker
 (feature 15) captures its scores in pass A, so it behaves identically.
 Multi-query decode keeps the one-pass flow.
 
-**Cost.** A step takes about LEN + survivors + 38 cycles instead of LEN + 34:
-57 to 70 cycles at LEN = 16 against 50, depending on how sharp the attention
-is, and 97 against 66 for a 32-token INT4 cache. Decode is limited by the host
+**Cost.** A step takes about LEN + survivors + 39 cycles instead of LEN + 34:
+58 to 71 cycles at LEN = 16 against 50, depending on how sharp the attention
+is, and 98 against 66 for a 32-token INT4 cache. Decode is limited by the host
 bus (36 µs per token over QSPI, feature 13, against 1.0 to 1.4 µs of compute
 at 50 MHz), so the extra cycles do not lower the token rate. What it buys is
 fewer 128-bit V reads and accumulator updates, which are half the SRAM traffic
@@ -939,9 +942,9 @@ max-first step match a normal step's.
 
 | Family | V reads, normal → max-first (16 steps, 136 keys) | Cycles at LEN = 16 |
 | --- | --- | --- |
-| random (flat) | 136 → 136 | 50 → 70 |
-| sharp | 69 → **41** (−41%) | 50 → 63 |
-| outliers | 77 → **52** (−32%) | 50 → 57 |
+| random (flat) | 136 → 136 | 50 → 71 |
+| sharp | 69 → **41** (−41%) | 50 → 64 |
+| outliers | 77 → **52** (−32%) | 50 → 58 |
 
 **In the language models** (`results/lm_perplexity.txt`, `results/lm_wikitext2.txt`):
 
