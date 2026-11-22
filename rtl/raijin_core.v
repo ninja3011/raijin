@@ -269,8 +269,15 @@ module raijin_core #(
     // RoPE on write: pairs of Q / K bytes are rotated before they reach SRAM
     wire          rope_hit   = bus_mem_we && rope_en && (region == 4'h0 || (region == 4'h1 && !k4));
     wire [7:0]    rope_xo, rope_yo;
+    // Token-window K writes take their row from LEN (through PTAB). For timing,
+    // RoPE sees a registered copy of that row: LEN and PTAB only change on
+    // earlier bus writes or at a step's start, never in the cycle before a
+    // K byte, so the copy always holds the current row.
+    reg  [LN-1:0] ttrow_r;
+    always @(posedge clk) ttrow_r <= ttrow;
+    wire [LN-1:0] rope_row = !twin ? addr_r[LD +: LN] : (tb < 6'd16) ? qrow : ttrow_r;
     raijin_rope u_rope (.clk(clk), .we_even(rope_hit && !bcol[0]), .pair(bcol[3:1]),
-        .pos(rope_abs ? ropepos : {{(8-LN){1'b0}}, brow}), .wdata(wdata_r),
+        .pos(rope_abs ? ropepos : {{(8-LN){1'b0}}, rope_row}), .wdata(wdata_r),
         .xo(rope_xo), .yo(rope_yo));
 
     always @(posedge clk) begin
@@ -605,6 +612,8 @@ module raijin_core #(
     reg  [NK-1:0]      mf_keep;
     reg  [LK:0]        mf_drop;               // keys dropped by the latched mask
     reg                mf_cnt;                // first MF_B cycle: mask is complete
+    reg                mf_cnt_d;              // the counters add mf_drop_r one cycle later
+    reg  [LK:0]        mf_drop_r;
     reg  signed [14:0] mf_t;
     reg  [LK-1:0]      mf_first;              // lowest set bit of mf_mask
     integer mi;
@@ -623,15 +632,18 @@ module raijin_core #(
         if (!rst_n) begin
             mb_v    <= 1'b0;
             mf_cnt  <= 1'b0;
+            mf_cnt_d <= 1'b0;
             mf_mask <= {NK{1'b0}};
         end else begin
             mb_v   <= (state == MF_B) && (|mf_mask);
             mf_cnt <= (state == MF_MASK);
+            mf_cnt_d <= mf_cnt;
             if (state == MF_MASK) mf_mask <= mf_keep;
             else if (state == MF_B && (|mf_mask)) mf_mask[mf_first] <= 1'b0;
         end
     end
     always @(posedge clk) begin
+        if (mf_cnt) mf_drop_r <= mf_drop;
         mb_j <= mf_first;
         mb_s <= mf_sc[mf_first];
     end
@@ -1079,12 +1091,10 @@ module raijin_core #(
             end
             if (busy_r) begin
                 cycles <= cycles + 32'd1;
-                skips  <= skips + nskip;
-                if (v_saved) vskips <= vskips + 32'd1;
-                if (mf_cnt) begin                    // keys pass B never visits
-                    skips  <= skips + nskip + mf_drop;
-                    vskips <= vskips + mf_drop;
-                end
+                // keys pass B never visits are counted one cycle after the
+                // mask is complete (registered popcount, for timing)
+                skips  <= skips + nskip + (mf_cnt_d ? mf_drop_r : {(LK+1){1'b0}});
+                vskips <= vskips + {31'd0, v_saved && !mf_cnt} + (mf_cnt_d ? mf_drop_r : {(LK+1){1'b0}});
             end
             case (state)
                 S_IDLE: begin
