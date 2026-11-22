@@ -10,7 +10,7 @@ Formats (summary):
   score s          : signed 12-bit, Q7.4 (log2 domain; host folds log2(e)/sqrt(d) into Q)
   running max m    : signed 9-bit integer, initial value -256
   p                : unsigned 9-bit, Q1.8
-  l                : unsigned 13-bit, Q5.8
+  l                : unsigned 14-bit, Q6.8 (sums up to 63.99, 32 keys of 1.0)
   acc              : signed 24-bit, sum of (p * v) >> dv
   1/l              : unsigned 13-bit, floor(2^19 / l)
   output           : MXINT8 row (INT8 elements + E8M0 exponent)
@@ -217,7 +217,7 @@ def attention(q, eq, k, ek, v, ev, *, fused: bool, mode: int = MODE_EXACT,
                     acc[c] += pv_term(p, v[j][c], dvs[j])
         for c in range(d):
             assert -(1 << 23) <= acc[c] < (1 << 23)
-        assert lsum < (1 << 13)
+        assert lsum < (1 << 14)
         ls.append(lsum)
         row, e = out_row(acc, recip(lsum), emax)
         o[i] = row
@@ -262,6 +262,7 @@ def attention_decode(q, eq, k, ek, v, ev, *, qrow: int, length: int,
         dv = emax - int(ev[j])
         for c in range(d):
             acc[c] = _sra(acc[c], dsh) + pv_term(p, v[j][c], dv)
+    assert lsum < (1 << 14), lsum          # the 14-bit l register
     row, e = out_row(acc, recip(lsum), emax)
     return PassResult(o=np.array([row], dtype=np.int64), eo=np.array([e], dtype=np.int64),
                       skips=skips, l=[lsum])

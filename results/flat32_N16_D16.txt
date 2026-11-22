@@ -1,0 +1,2 @@
+flat LEN=32 max_first=0: l=8192 cos vs mean(V)=1.00000 cycles=66
+flat LEN=32 max_first=1: l=8192 cos vs mean(V)=1.00000 cycles=103

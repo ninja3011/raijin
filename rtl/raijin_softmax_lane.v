@@ -49,7 +49,7 @@ module raijin_softmax_lane #(
     output reg               out_mask,
     // state
     output reg  signed [8:0] m,
-    output reg  [12:0]       l,
+    output reg  [13:0]       l,          // Q6.8: sums up to 63.99 (32 keys of 1.0)
     // reciprocal
     input  wire              recip_start,
     output reg               r_valid,
@@ -98,26 +98,26 @@ module raijin_softmax_lane #(
     raijin_exp2 u_exp (.s(a_s), .m(a_m), .mode(mode), .p(p), .sa(sa), .sb(sb));
 
     wire [4:0]  dsh = (a_delta > 10'd31) ? 5'd31 : a_delta[4:0];
-    wire [12:0] l_b  = a_first ? 13'd0 : l;              // l before this key
-    wire [12:0] l_sh = l_b >> dsh;
+    wire [13:0] l_b  = a_first ? 14'd0 : l;              // l before this key
+    wire [13:0] l_sh = l_b >> dsh;
     wire signed [14:0] t_k  = ($signed(a_m) <<< 4) - $signed(a_s);
     wire        prune = (thr != 4'd0) && (t_k[14:4] >= {7'd0, thr});
     wire        zero  = a_mask || prune;
     wire [8:0]  p_e  = zero ? 9'd0 : p;                   // masked / pruned: nothing
-    wire [12:0] l_nx = l_sh + {4'd0, p_e};
+    wire [13:0] l_nx = l_sh + {5'd0, p_e};
     reg         auto_go;                                  // reciprocal of l_fin
-    reg  [12:0] l_fin;
+    reg  [13:0] l_fin;
     reg  [4:0]  b_delta;
     assign out_delta = b_delta;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             out_valid <= 1'b0;
-            l         <= 13'd0;
+            l         <= 14'd0;
             auto_go   <= 1'b0;
         end else if (clear) begin
             out_valid <= 1'b0;
-            l         <= 13'd0;
+            l         <= 14'd0;
             auto_go   <= 1'b0;
         end else begin
             out_valid <= a_valid;
@@ -144,9 +144,9 @@ module raijin_softmax_lane #(
     reg [13:0] rem;
     reg [3:0]  cnt;
     reg        busy;
-    reg [12:0] l_div;                 // divisor, latched at the start
+    reg [13:0] l_div;                 // divisor, latched at the start
     wire [14:0] rem2 = {rem, 1'b0};
-    wire        ge   = rem2 >= {2'b00, l_div};
+    wire        ge   = rem2 >= {1'b0, l_div};
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             busy    <= 1'b0;
@@ -162,7 +162,7 @@ module raijin_softmax_lane #(
             cnt     <= 4'd12;
             r       <= 13'd0;
         end else if (busy) begin
-            rem <= ge ? (rem2 - {2'b00, l_div}) : rem2[13:0];
+            rem <= ge ? (rem2[13:0] - l_div) : rem2[13:0];
             r   <= {r[11:0], ge};
             if (cnt == 4'd0) begin
                 busy    <= 1'b0;

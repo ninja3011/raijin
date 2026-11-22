@@ -544,7 +544,7 @@ module raijin_core #(
     generate
         for (gr = 0; gr < P; gr = gr + 1) begin : g_sm
             wire signed [11:0] s_in = !fused ? sb_rd[gr*12 +: 12] : mb_v ? mb_s : score[gr*12 +: 12];
-            wire [12:0]       l_unused;
+            wire [13:0]       l_unused;
             raijin_softmax_lane #(.TW(TW)) u_lane (
                 .clk(clk), .rst_n(rst_n), .clear(sm_clear), .mode(mode),
                 .s_valid(sm_valid), .s(s_in), .tag(sm_tag_in),

@@ -89,8 +89,8 @@ def decode_causal(q, eq, k, ek, v, ev, mode=rm.MODE_EXACT, thr=0, offset=0, stat
         zeros += int(np.sum(live & (p == 0)))
         dsh = np.minimum(delta, 31)
         lraw = (l >> dsh) + p
-        lwrap += int(np.sum(use & (lraw >= (1 << 13))))  # the 13-bit l register would wrap
-        l = np.where(use, lraw & 0x1FFF, l)
+        lwrap += int(np.sum(use & (lraw >= (1 << 14))))  # the 14-bit l register would wrap
+        l = np.where(use, lraw & 0x3FFF, l)
         dv = np.minimum(emax - ev[..., j:j + 1], 31)       # (..., T)
         term = (p[..., None] * v[..., None, j, :]) >> dv[..., None]
         acc = np.where(use[..., None], (acc >> dsh[..., None]) + term, acc)
