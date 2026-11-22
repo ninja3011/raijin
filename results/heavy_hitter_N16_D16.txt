@@ -1,2 +1,2 @@
-hh random   after 16 steps: acc=[1926, 1286, 740, 1375, 1056, 1293, 521, 765, 700, 575, 353, 525, 309, 240, 22, 8] HHMIN=10 decode cycles at LEN=N: 62
-hh sharp    after 16 steps: acc=[663, 762, 228, 761, 635, 262, 69, 252, 9, 79, 0, 5, 322, 0, 0, 8] HHMIN=10 decode cycles at LEN=N: 62
+hh random   after 16 steps: acc=[1926, 1286, 740, 1375, 1056, 1293, 521, 765, 700, 575, 353, 525, 309, 240, 22, 8] HHMIN=10 decode cycles at LEN=N: 64
+hh sharp    after 16 steps: acc=[663, 762, 228, 761, 635, 262, 69, 252, 9, 79, 0, 5, 322, 0, 0, 8] HHMIN=10 decode cycles at LEN=N: 64
