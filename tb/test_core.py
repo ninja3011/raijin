@@ -695,6 +695,55 @@ async def test_max_first_decode(dut):
 
 
 @cocotb.test()
+async def test_flat_32_keys(dut):
+    """The softmax sum l is 14 bits (Q6.8): a 32-token INT4 cache with flat
+    attention sums to 32.0, which the old 13-bit register wrapped. A zero
+    query gives every key weight exactly 1.0; the output must be the mean of V, bit-exact
+    with the model, in normal and max-first decode."""
+    bus = await setup(dut)
+    rng = np.random.default_rng(int(os.environ.get("RAIJIN_SEED", 7)) + 113)
+    await bus.write(0x5012, 3)
+    T = 2 * N
+    qf, kf, vf = rm.random_case(rng, n=T, d=D, scale=1.0)
+    qf[T - 1] = 0.0                                # every score 0: p = 1.0 each, l = 32 * 256
+    q, eq, k, ek, v, ev = rm.prepare_kv4(qf, kf, vf)
+    for base, mat in ((0x1000, k), (0x2000, v)):
+        for t in range(T):
+            for b, byte in enumerate(rm.pack4(mat[t])):
+                await bus.write(base + 8 * t + b, byte)
+    for t in range(T):
+        await bus.write(0x4100 + t, int(ek[t]))
+        await bus.write(0x4200 + t, int(ev[t]))
+    row = 3
+    for c in range(D):
+        await bus.write(row * D + c, int(q[T - 1][c]))
+    await bus.write(0x4000 + row, int(eq[T - 1]))
+    mq = np.zeros((N, D), dtype=np.int64)
+    meq = np.zeros(N, dtype=np.int64)
+    mq[row], meq[row] = q[T - 1], eq[T - 1]
+    vmean = rm.mx_dequantize(v, ev).mean(axis=0)
+    lines = []
+    for mf in (False, True):
+        await bus.write(0x5013, 0x80 if mf else 0)
+        await bus.write(0x5010, T)
+        await bus.write(0x5011, row)
+        await bus.write(0x5000, 1 | (1 << 4))
+        await wait_done(dut)
+        o, eo, cycles, _ = await read_out(bus, rows=[row])
+        exp = rm.attention_decode(mq, meq, k, ek, v, ev, qrow=row, length=T, final_max=mf)
+        assert exp.l[0] == T * 256, exp.l
+        assert np.array_equal(o[row], exp.o[0]) and eo[row] == exp.eo[0], f"mf={mf}: rtl={o[row]} model={exp.o[0]}"
+        got = rm.mx_dequantize(o[row:row + 1], eo[row:row + 1])[0]
+        lines.append(f"flat LEN={T} max_first={int(mf)}: l={exp.l[0]} cos vs mean(V)={_cos(got, vmean):.5f} cycles={cycles}")
+        assert _cos(got, vmean) > 0.999, lines[-1]
+        dut._log.info(lines[-1])
+    await bus.write(0x5013, 0)
+    await bus.write(0x5012, 0)
+    with open(os.path.join(os.path.dirname(__file__), "..", "results", f"flat32_N{N}_D{D}.txt"), "w") as f:
+        f.write(chr(10).join(lines) + chr(10))
+
+
+@cocotb.test()
 async def test_key_skip(dut):
     """Hardware key skip (SKIPTHR, 0x5013): keys scoring SKIPTHR or more powers
     of two below the running max get p = 0. When no row of a P-row group uses a

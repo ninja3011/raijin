@@ -1019,7 +1019,7 @@ The same model, trained from scratch on the WikiText-2 training split (Merity et
 
 The ranking of the variants is the same as on Tiny Shakespeare, except that V-only MXFP4 and V-only INT4 swap places (they are within 0.1% of each other on both), and every cost is a little smaller, so the conclusions above are not an artefact of one dataset.
 
-**Range of the softmax sum.** The l register is 13 bits (Q5.8), so it holds sums up to 31.99. Each key adds at most 1.0, so a pass over 32 or more keys with nearly flat attention could wrap it. The vector model counts every step where the 13-bit register would wrap: none occurred in either benchmark at context 32. Contexts beyond 31 keys in one pass (the 32-token INT4 cache with flat attention, or the scaling model's N = 512) need l widened to log2(N) + 8 bits. That is a parameter change in `raijin_softmax_lane.v` and the reciprocal, and it is listed as future work.
+**Range of the softmax sum.** The l register was 13 bits (Q5.8), holding sums up to 31.99. Each key adds at most 1.0, so a decode step over the full 32-token INT4/MXFP4 cache with flat attention could wrap it, which is exactly the steady state of long generation with eviction. It is now 14 bits (Q6.8, up to 63.99) in the lane and the reciprocal divider; `tb/test_core.py::test_flat_32_keys` gives 32 keys weight exactly 1.0 (l = 8192), fails on the old RTL and is bit-exact on the new one (`results/flat32_N16_D16.txt`). The vector model counts steps that would wrap the 14-bit register: none in either benchmark. Longer single passes (the scaling model's N = 512) need log2(N) + 8 bits.
 
 ## Analytical scaling model
 
