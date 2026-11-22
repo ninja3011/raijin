@@ -204,6 +204,17 @@ module raijin_core #(
     assign done = done_r;
     wire mf = (mode != 2'd0);
     wire [LP-1:0] qlane = qrow % P;
+    // one-hot decode lane, registered in three copies (qrow only changes while
+    // the core is idle): the lane muxes below are AND-OR trees on a local
+    // copy instead of a die-wide qlane broadcast
+    wire [P-1:0]   qsel_d = {{(P-1){1'b0}}, 1'b1} << qlane;
+    wire [3*P-1:0] qsel_bus;
+    raijin_dupreg #(.W(P), .C(3)) u_qsel (.clk(clk), .d(qsel_d), .q(qsel_bus));
+    wire [P-1:0]   qsel_s = qsel_bus[0 +: P];     // score capture
+    wire [P-1:0]   qsel_m = qsel_bus[P +: P];     // final m
+    wire [P-1:0]   qsel_a = qsel_bus[2*P +: P];   // accumulate lane enable
+    reg  signed [11:0] score_q;                   // score of the query lane
+    reg  signed [8:0]  m_q;                       // running m of the query lane
     wire          pipe  = fused && !decode;   // group-pipelined fused pass
     localparam    L_MIN = 14 + P;             // min cycles between two groups' last keys
     reg  [4:0]    since_last;                 // cycles since the last group's last key
@@ -552,6 +563,16 @@ module raijin_core #(
         end
     endgenerate
 
+    integer qi2;
+    always @(*) begin
+        score_q = 12'sd0;
+        m_q     = 9'sd0;
+        for (qi2 = 0; qi2 < P; qi2 = qi2 + 1) begin
+            score_q = score_q | ({12{qsel_s[qi2]}} & score[qi2*12 +: 12]);
+            m_q     = m_q     | ({9{qsel_m[qi2]}} & sm_m[qi2*9 +: 9]);
+        end
+    end
+
     // ---- heavy-hitter tracker (feature 15, region 7) ----
     // physical slot of the key now entering the lanes (same mapping as pj)
     wire          sj_is4 = pfmt[sm_j[LK-1:LPG]];
@@ -563,9 +584,9 @@ module raijin_core #(
     raijin_hh #(.NK(NK), .LK(LK)) u_hh (
         .clk(clk), .rst_n(rst_n),
         .cap_valid(decode && !multi && dpu_valid[0]), .cap_slot(pj_s),
-        .cap_s(score[qlane*12 +: 12]),
+        .cap_s(score_q),
         .cap_recent({1'b0, sm_j} + hh_recent >= len), .cap_clear(state == F_CLR && decode),
-        .go(state == RCP_START && decode && !multi), .m_fin(sm_m[qlane*9 +: 9]),
+        .go(state == RCP_START && decode && !multi), .m_fin(m_q),
         .busy(hh_busy),
         .bus_we(we_r && !busy_r && region == 4'h7), .bus_off(boff[7:0]),
         .bus_wdata(wdata_r), .bus_rdata(hh_rd), .en(hh_en), .recent(hh_recent));
@@ -574,14 +595,16 @@ module raijin_core #(
     reg  signed [11:0] mf_sc [0:NK-1];
     reg  [NK-1:0]      mf_mask;               // keys pass B still has to visit
     always @(posedge clk) begin
-        if (mfd && mf_a && dpu_valid[0]) mf_sc[dpu_tag[LK-1:0]] <= score[qlane*12 +: 12];
+        if (mfd && mf_a && dpu_valid[0]) mf_sc[dpu_tag[LK-1:0]] <= score_q;
     end
     // a key survives if its weight against the final m can be nonzero:
     // fewer than 9 (or SKIPTHR) powers of two below m (the lanes' own rule)
-    wire signed [8:0] mf_m   = sm_m[qlane*9 +: 9];
+    reg  signed [8:0] mf_m;                  // final m, registered for the mask
+    always @(posedge clk) mf_m <= m_q;
     wire        [3:0] mf_lim = (thr != 4'd0 && thr < 4'd9) ? thr : 4'd9;
     reg  [NK-1:0]      mf_keep;
-    reg  [LK:0]        mf_drop;               // keys dropped by the mask
+    reg  [LK:0]        mf_drop;               // keys dropped by the latched mask
+    reg                mf_cnt;                // first MF_B cycle: mask is complete
     reg  signed [14:0] mf_t;
     reg  [LK-1:0]      mf_first;              // lowest set bit of mf_mask
     integer mi;
@@ -590,7 +613,7 @@ module raijin_core #(
         for (mi = 0; mi < NK; mi = mi + 1) begin
             mf_t = ($signed({{2{mf_m[8]}}, mf_m}) <<< 4) - $signed({{3{mf_sc[mi][11]}}, mf_sc[mi]});
             mf_keep[mi] = (mi < len) && (mf_t[14:4] < {7'd0, mf_lim});
-            if (mi < len && !mf_keep[mi]) mf_drop = mf_drop + 1'b1;
+            if (mi < len && !mf_mask[mi]) mf_drop = mf_drop + 1'b1;
         end
         mf_first = {LK{1'b0}};
         for (mi = NK - 1; mi >= 0; mi = mi - 1)
@@ -599,9 +622,11 @@ module raijin_core #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             mb_v    <= 1'b0;
+            mf_cnt  <= 1'b0;
             mf_mask <= {NK{1'b0}};
         end else begin
-            mb_v <= (state == MF_B) && (|mf_mask);
+            mb_v   <= (state == MF_B) && (|mf_mask);
+            mf_cnt <= (state == MF_MASK);
             if (state == MF_MASK) mf_mask <= mf_keep;
             else if (state == MF_B && (|mf_mask)) mf_mask[mf_first] <= 1'b0;
         end
@@ -667,7 +692,7 @@ module raijin_core #(
             end
         end
         for (ai = 0; ai < P; ai = ai + 1) begin
-            acc_lane[ai] = (!decode || multi || (qlane == ai)) && !(fused && sm_omask[ai]);
+            acc_lane[ai] = (!decode || multi || qsel_a[ai]) && !(fused && sm_omask[ai]);
             acc_en[ai]   = acc_valid && acc_lane[ai] && (acc_p[ai*9 +: 9] != 9'd0);
         end
     end
@@ -1056,7 +1081,7 @@ module raijin_core #(
                 cycles <= cycles + 32'd1;
                 skips  <= skips + nskip;
                 if (v_saved) vskips <= vskips + 32'd1;
-                if (state == MF_MASK) begin          // keys pass B never visits
+                if (mf_cnt) begin                    // keys pass B never visits
                     skips  <= skips + nskip + mf_drop;
                     vskips <= vskips + mf_drop;
                 end
@@ -1199,8 +1224,8 @@ module raijin_core #(
                         end else if (pipe) begin
                             state <= P_WAIT;
                         end else begin
-                            // max-first: the last score reaches the lanes 4 cycles on
-                            dcnt  <= mf_a ? 4'd3 : 4'd6;
+                            // max-first: the last score reaches the lanes 4 cycles on, m is registered once more
+                            dcnt  <= mf_a ? 4'd4 : 4'd6;
                             state <= mf_a ? MF_WAIT : F_DRAIN;
                         end
                     end
