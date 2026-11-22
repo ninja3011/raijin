@@ -62,13 +62,27 @@ module raijin_hh #(
     assign recent = recent_r;
     assign busy = walking;
 
+    // The walk is a 3-stage pipeline (timing: the 32:1 slot read, the weight
+    // and the add-compare were one path from k to best):
+    //   R: read slot kk          -> r_*   (sc, acc, flags)
+    //   W: weight from r_sc, m_l -> w_*   (weight, acc, flags)
+    //   A: saturating add, write acc back, argmin compare
+    // Each slot is visited once, so the write-back in A never races a read in R.
     wire [LK-1:0] kk     = k[LK-1:0];
-    wire signed [13:0] d = ($signed({m_l[8], m_l}) <<< 4) - $signed({{2{sc[kk][11]}}, sc[kk]});
+    reg               r_v, w_v;
+    reg  [LK-1:0]     r_k, w_k;
+    reg signed [11:0] r_sc;
+    reg  [15:0]       r_acc, w_acc;
+    reg               r_used, r_cand, w_used, w_cand;
+    reg  [8:0]        w_w;
+    reg               w_last, r_last;
+    wire signed [13:0] d = ($signed({m_l[8], m_l}) <<< 4) - $signed({{2{r_sc[11]}}, r_sc});
     wire [9:0]    di     = d[13] ? 10'd0 : d[13:4];
     wire [8:0]    w0     = (d[13] || !d[3]) ? 9'd256 : 9'd181;
     wire [8:0]    w      = (di > 10'd8) ? 9'd0 : (w0 >> di[3:0]);
-    wire [16:0]   sum    = {1'b0, acc[kk]} + {8'd0, w};
+    wire [16:0]   sum    = {1'b0, w_acc} + {8'd0, w_w};
     wire [15:0]   nacc   = sum[16] ? 16'hFFFF : sum[15:0];
+    wire          better = w_used && w_cand && {1'b0, nacc} < best;
 
     wire          ctl_w  = bus_we && bus_off == 8'h80;
     wire          acc_w  = bus_we && !bus_off[7];
@@ -82,6 +96,8 @@ module raijin_hh #(
             walking <= 1'b0;
             used    <= {NK{1'b0}};
             k       <= 0;
+            r_v     <= 1'b0;
+            w_v     <= 1'b0;
             for (i = 0; i < NK; i = i + 1) acc[i] <= 16'd0;
         end else begin
             if (ctl_w) begin
@@ -106,18 +122,38 @@ module raijin_hh #(
                 best    <= 17'h1FFFF;
                 best_k  <= {LK{1'b0}};
             end else if (walking) begin
-                if (used[kk]) begin
-                    acc[kk] <= nacc;
-                    if (kk >= skip && !rec[kk] && {1'b0, nacc} < best) begin
+                // stage R
+                r_v    <= !k[LK];
+                r_k    <= kk;
+                r_sc   <= sc[kk];
+                r_acc  <= acc[kk];
+                r_used <= used[kk];
+                r_cand <= kk >= skip && !rec[kk];
+                r_last <= k == NK - 1;
+                if (!k[LK]) k <= k + 1'b1;
+                // stage W
+                w_v    <= r_v;
+                w_k    <= r_k;
+                w_w    <= w;
+                w_acc  <= r_acc;
+                w_used <= r_used;
+                w_cand <= r_cand;
+                w_last <= r_v && r_last;
+                // stage A
+                if (w_v) begin
+                    if (w_used) acc[w_k] <= nacc;
+                    if (better) begin
                         best   <= {1'b0, nacc};
-                        best_k <= kk;
+                        best_k <= w_k;
+                    end
+                    if (w_last) begin
+                        walking <= 1'b0;
+                        minslot <= better ? w_k : best_k;
                     end
                 end
-                k <= k + 1'b1;
-                if (k == NK - 1) begin
-                    walking <= 1'b0;
-                    minslot <= (kk >= skip && used[kk] && !rec[kk] && {1'b0, nacc} < best) ? kk : best_k;
-                end
+            end else begin
+                r_v <= 1'b0;
+                w_v <= 1'b0;
             end
         end
     end

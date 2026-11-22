@@ -67,7 +67,7 @@ after another, so the MAC arrays sit idle for about 64% of the pass.
 | 12 | QSPI host port (0x32 quad write, 0x6B quad read, io[3:0]) | RTL merged | A full Q/K/V load drops from 1,069 µs to **286 µs** (3.7×). Bus time per decode token drops from 135 µs to **66.9 µs**, so the host-limited rate goes from 7,400 to about **15,000 tokens/s**. Plain SPI hosts still work |
 | 13 | Token window (region 0x6000): one write burst and one read burst per decode token | RTL merged | Bus time per decode token over QSPI 66.9 → **36.2 µs**, about **27,700 tokens/s** host-limited: 3.7× the single-lane SPI baseline of feature 11. Works with paging and RoPE |
 | 14 | Per-page mixed KV precision (PAGED bit 1, PFMT 0x501B) | RTL merged | 24 tokens in the 16-word cache: 2 INT8 pages + 4 INT4 pages. On sharp attention, mean decode cosine 0.9656 (all INT4) → **0.9914** with INT8 for the sink page and the worst-error page. No cycle cost |
-| 15 | Heavy-hitter tracker for KV eviction (region 0x7000, `rtl/raijin_hh.v`) | RTL merged | Per-slot accumulators of attention weight and an on-chip argmin (HHMIN) give the host its H2O eviction victim with one byte read, also in the token window. Decode step 50 → **62** cycles at LEN = 16 with the tracker on, unchanged when off. Bit-exact with the model. On the char LMs, chip H2O matches FP H2O within 0.25% and beats a sliding window at budget 16 (4.608 vs 4.633), but loses at budget 8 |
+| 15 | Heavy-hitter tracker for KV eviction (region 0x7000, `rtl/raijin_hh.v`) | RTL merged | Per-slot accumulators of attention weight and an on-chip argmin (HHMIN) give the host its H2O eviction victim with one byte read, also in the token window. Decode step 50 → **64** cycles at LEN = 16 with the tracker on (three-stage walk for timing), unchanged when off. Bit-exact with the model. On the char LMs, chip H2O matches FP H2O within 0.25% and beats a sliding window at budget 16 (4.608 vs 4.633), but loses at budget 8 |
 | 16 | MXFP4 KV elements (KVFMT bits 2, 3: E2M1 nibbles) | RTL merged | Same storage and cycles as MXINT4; a 16-entry nibble decoder in front of the shared INT8 datapath. Bit-exact in full passes, 2N-token decode and mixed paging. Row RMS error 0.128 → **0.109**; with K and V both 4-bit, char-LM cost +3.33% → **+2.61%** (Tiny Shakespeare) and +2.96% → **+2.71%** (WikiText-2). V-only is a wash |
 | 17 | Max-first decode (SKIPTHR bit 7) | RTL merged | Pass A scores all cached keys and finds the true maximum; pass B visits only keys with nonzero weight. In the char LMs the share of keys needing a V read drops from 86% to **36%** (Tiny Shakespeare) and 84% to **31%** (WikiText-2), for +0.06% and +0.05% perplexity. Bit-exact. Decode at LEN = 16 takes 58 to 71 cycles instead of 50 (it is bus-limited anyway) |
 
@@ -777,8 +777,11 @@ the scores already are.
 | 0x083 | HHRECENT | keys among the newest HHRECENT of the step are never chosen |
 
 **Cost.** The walk runs in parallel with the reciprocal and output stages, and
-the step's DONE waits for it. A decode step at LEN = 16 takes **62** cycles
-with the tracker on against 50 off. The tracker is idle and adds no cycles when
+the step's DONE waits for it. A decode step at LEN = 16 takes **64** cycles
+with the tracker on against 50 off. The walk is a three-stage pipeline (slot
+read, weight, add and argmin compare): in the chip_p2_final4 layout the
+single-cycle version was the worst setup path at tt (k → best, −0.32 ns), and
+the two extra stages cost two cycles per step. The tracker is idle and adds no cycles when
 HHCTL bit 0 is clear. Walking only the used slots would cut the overhead at
 short lengths; this is left as a possible refinement.
 
