@@ -62,9 +62,12 @@ CONFIGS = {
     "chip-fp4-window32": dict(policy="window", budget=32,   chip=True, kf="fp4", vf="fp4"),
     "fp32-h2o32":        dict(policy="h2o",    budget=32,   chip=False, decay=True),
     "fp32-h2o32-nodecay": dict(policy="h2o",   budget=32,   chip=False, decay=False),
+    "fp32-h2o32-r24":    dict(policy="h2o",    budget=32,   chip=False, decay=True, recent=24),
     "chip-fp4-h2o32":    dict(policy="h2o",    budget=32,   chip=True, kf="fp4", vf="fp4", decay=True),
+    "chip-fp4-h2o32-r24": dict(policy="h2o",   budget=32,   chip=True, kf="fp4", vf="fp4", decay=True,
+                               recent=24),
 }
-STORY_CONFIGS = ("fp32-full", "chip-fp4-window32", "chip-fp4-h2o32")
+STORY_CONFIGS = ("fp32-full", "chip-fp4-window32", "chip-fp4-h2o32", "chip-fp4-h2o32-r24")
 DECAY_EVERY = 16
 
 
@@ -131,7 +134,7 @@ class State:
             for a in acc:
                 for x in a:
                     a[x] *= 0.5
-        recent = b // 2
+        recent = c.get("recent", b // 2)
         for hh in range(h):
             keep[hh].append(p)
             acc[hh][p] = 0.0
@@ -294,7 +297,7 @@ def main():
     ap.add_argument("--data")
     ap.add_argument("--words", type=int, default=1000)
     ap.add_argument("--ppl-tokens", type=int, default=1024)
-    ap.add_argument("--ppl-seqs", type=int, default=2)
+    ap.add_argument("--ppl-seqs", type=int, default=8, help="longest validation stories to score")
     ap.add_argument("--prompt", default="Once upon a time, in a small village by the sea, there lived a girl named Lily.")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
@@ -310,8 +313,15 @@ def main():
     calib = [ids[-(i + 1) * 64: -i * 64 or None] for i in range(16)]       # far end of the file
     mu = calibrate(model, calib)
     eos = tok.eos_token_id
-    # 1) long-context perplexity, teacher forced
-    seqs = [ids[i * args.ppl_tokens:(i + 1) * args.ppl_tokens] for i in range(args.ppl_seqs)]
+    # 1) long-context perplexity, teacher forced, one story per sequence. The model
+    # was trained on single stories, so a window that crosses <|endoftext|> into
+    # an unrelated story is not a fair "full context" baseline: split at EOS and
+    # take the longest stories (each starts at position 0, like a real prompt).
+    stories = [x for x in torch.tensor_split(ids, (ids == eos).nonzero()[:, 0].tolist()) if len(x) > 1]
+    stories = [x[1:] if x[0] == eos else x for x in stories]
+    stories = sorted(stories[: len(stories) - 16], key=len, reverse=True)   # calib is the tail
+    seqs = [x[: args.ppl_tokens] for x in stories[: args.ppl_seqs]]
+    print(f"perplexity on {len(seqs)} stories of {min(map(len, seqs))}-{max(map(len, seqs))} tokens", flush=True)
     rows = []
     for name, c in CONFIGS.items():
         t0 = time.time()
@@ -324,10 +334,12 @@ def main():
         rows.append((name, math.exp(-lp.mean()), vr))
         print(f"{name:20s} ppl={rows[-1][1]:.4f} ({time.time() - t0:.0f} s)", flush=True)
     base = rows[0][1]
+    n_scored = sum(len(x) - 32 for x in seqs)
     lines = [f"# Long-context perplexity: {MODEL} with Raijin's KV-cache budget", "",
-             f"{args.ppl_seqs} sequences of {args.ppl_tokens} tokens of TinyStories validation text, decoded one token "
-             f"at a time; perplexity over positions 32 and later. {SINKS} sink tokens; H2O keeps a recent window of "
-             "half the budget; with decay the accumulators halve every 16 steps (HHCTL halve). GPT-Neo's local "
+             f"The {len(seqs)} longest TinyStories validation stories ({min(map(len, seqs))}-{max(map(len, seqs))} "
+             f"tokens, one story per sequence, starting at position 0), decoded one token "
+             f"at a time; perplexity over positions 32 and later ({n_scored} predictions). {SINKS} sink tokens; H2O keeps a recent window of "
+             "half the budget (r24: 24 tokens); with decay the accumulators halve every 16 steps (HHCTL halve). GPT-Neo's local "
              "layers keep their 256-token reach under every policy. "
              "Chip rows: MF2, SKIPTHR = 6, max-first decode, key mean folded out of K.", "",
              "| Configuration | Cache | Perplexity | vs FP32 full context | Keys needing a V read |",
