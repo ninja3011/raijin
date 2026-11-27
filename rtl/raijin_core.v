@@ -418,11 +418,7 @@ module raijin_core #(
     wire [LK-1:0] pj_d1   = mx_on ? ({ptab[j_d1[LK-1:LPG]], {LPG{1'b0}}} + (jd1_is4 ? j_d1[LPG-1:0] : {j_d1[LPG-1:0], 1'b0}))
                           : pg_on ? {ptab[j_d1[LK-1:LPG]], j_d1[LPG-1:0]} : j_d1;
     reg  [LK-1:0] pj_d2;                     // K row in d1_r
-    reg           k4_d2;
-    always @(posedge clk) begin
-        pj_d2 <= pj_d1;
-        k4_d2 <= mx_on ? jd1_is4 : k4;
-    end
+    always @(posedge clk) pj_d2 <= pj_d1;
 
     // MXINT4 K/V: pick token t's half of the SRAM word and widen each nibble
     // to INT8 as x4 << 4 (the host's e_k / e_v account for the 4-bit shift).
@@ -441,18 +437,27 @@ module raijin_core #(
             fp4to8 = n[3] ? (~mag + 8'd1) : mag;
         end
     endfunction
-    function [D*8-1:0] unpack4;
+    // The unpack selects (4-bit or not, which half, FP4 or INT4) fan out to
+    // every element of the row. For timing each group of four elements has its
+    // own registered copy (raijin_dupreg), like the decode lane select.
+    localparam UG = 4;                              // element groups per row
+    wire [3*UG-1:0] ksel_bus;
+    raijin_dupreg #(.W(3), .C(UG)) u_ksel (.clk(clk), .d({kfp, pj_d1[0], mx_on ? jd1_is4 : k4}), .q(ksel_bus));
+    function [7:0] unpack_el;
         input [NB*32-1:0] w;
-        input             hi;
-        input             fp;
-        integer c;
+        input [7:0]       c;
+        input [2:0]       sel;              // {fp, hi, is4}
         begin
-            for (c = 0; c < D; c = c + 1)
-                unpack4[c*8 +: 8] = fp ? fp4to8(w[(hi ? 64 : 0) + c*4 +: 4])
-                                       : {w[(hi ? 64 : 0) + c*4 +: 4], 4'd0};
+            if (!sel[0])     unpack_el = w[c*8 +: 8];
+            else if (sel[2]) unpack_el = fp4to8(w[(sel[1] ? 64 : 0) + c*4 +: 4]);
+            else             unpack_el = {w[(sel[1] ? 64 : 0) + c*4 +: 4], 4'd0};
         end
     endfunction
-    wire [D*8-1:0] k_row = k4_d2 ? unpack4(d1_r, pj_d2[0], kfp) : d1_r;
+    reg [D*8-1:0] k_row;
+    integer ke;
+    always @(*)
+        for (ke = 0; ke < D; ke = ke + 1)
+            k_row[ke*8 +: 8] = unpack_el(d1_r, ke, ksel_bus[3*(ke*UG/D) +: 3]);
 
     integer qi;
     always @(posedge clk) begin
@@ -732,7 +737,7 @@ module raijin_core #(
 
     reg            av1, av2;
     reg [LK-1:0]   aj1, aj2;
-    reg            av41, av42;
+    reg            av41;
     reg [P*9-1:0]  ap1, ap2;
     reg [P*4-1:0]  asa1, asa2, asb1, asb2;
     reg [P*5-1:0]  ad1, ad2;
@@ -757,7 +762,7 @@ module raijin_core #(
     end
     always @(posedge clk) begin
         aj1 <= pacc;       aj2 <= aj1;   // physical token: V nibble half, dv
-        av41 <= v4_acc;    av42 <= av41;
+        av41 <= v4_acc;
         ap1 <= acc_p;      ap2 <= ap1;
         asa1 <= acc_sa;    asa2 <= asa1;
         asb1 <= acc_sb;    asb2 <= asb1;
@@ -765,11 +770,20 @@ module raijin_core #(
         aln1 <= acc_lane;  aln2 <= aln1;
     end
 
+    // V row unpack, with per-group select copies as for K (timing)
+    wire [3*UG-1:0] vsel_bus;
+    raijin_dupreg #(.W(3), .C(UG)) u_vsel (.clk(clk), .d({vfp, aj1[0], av41}), .q(vsel_bus));
+    reg [D*8-1:0] v_row;
+    integer ve;
+    always @(*)
+        for (ve = 0; ve < D; ve = ve + 1)
+            v_row[ve*8 +: 8] = unpack_el(d0_r, ve, vsel_bus[3*(ve*UG/D) +: 3]);
+
     wire acc_clear = (state == U_PV_CLR) || (state == F_CLR);
     wire [P*D*24-1:0] acc;
     raijin_acc_array #(.R(P), .D(D)) u_acc (
         .clk(clk), .rst_n(rst_n), .clear(acc_clear), .mf(mf),
-        .v(av42 ? unpack4(d0_r, aj2[0], vfp) : d0_r), .dv(dvr[aj2]),
+        .v(v_row), .dv(dvr[aj2]),
         .en(aen2), .first(af2), .p(ap2), .sa(asa2), .sb(asb2), .delta(ad2),
         .acc(acc)
     );
