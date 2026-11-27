@@ -1,6 +1,6 @@
 # Story: chip-fp4-window32
 
-roneneldan/TinyStories-8M, 1460 tokens, 1005 words, every attention head on the Raijin chip model, cache: 32 tokens, window. Sampling: top-k 40, temperature 0.8, seed 7, end-of-text banned. Generated in 130 s.
+roneneldan/TinyStories-8M, 1460 tokens, 1005 words, every attention head on the Raijin chip model, cache: 32 tokens, window. Sampling: top-k 40, temperature 0.8, seed 7, end-of-text banned. Generated in 191 s.
 
 Once upon a time, in a small village by the sea, there lived a girl named Lily. Lily loved to dance, but she was always very foolish and never listened to her mom and dad. One day, Lily was dancing when she met a boy named Billy who also loved to dance.
 

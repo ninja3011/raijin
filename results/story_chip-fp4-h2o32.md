@@ -1,6 +1,6 @@
 # Story: chip-fp4-h2o32
 
-roneneldan/TinyStories-8M, 1684 tokens, 1003 words, every attention head on the Raijin chip model, cache: 32 tokens, h2o. Sampling: top-k 40, temperature 0.8, seed 7, end-of-text banned. Generated in 178 s.
+roneneldan/TinyStories-8M, 1684 tokens, 1003 words, every attention head on the Raijin chip model, cache: 32 tokens, h2o. Sampling: top-k 40, temperature 0.8, seed 7, end-of-text banned. Generated in 83531 s.
 
 Once upon a time, in a small village by the sea, there lived a girl named Lily. Lily loved to dance, but she was always very foolish and never listened to her mommy and daddy. One day, she saw a big castle and decided to climb the tall tower.
 
