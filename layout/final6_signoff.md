@@ -62,8 +62,8 @@ Antenna: one net over the ratio, u_core.u_acc.g_row[0].g_lane[2].t_r[15] at hold
 
 ## Reading
 
-- Meets 50 MHz at the nominal and fast-leakage typical corners (nom_tt +0.140 ns, min_tt +0.954 ns) and at every fast corner; max_tt (slow-leakage typical) misses by 0.67 ns on ten paths (decode -> DPU1 partial sum, page table -> RoPE angle).
-- The slow corner (100 C, 1.60 V) misses by about 18-20 ns. The SRAM macro has only a TT timing view, so the ss numbers treat the SRAM as typical; about 26 MHz is realistic there.
+- Meets 50 MHz at the typical process corner with nominal and minimum wire RC (nom_tt +0.140 ns, min_tt +0.954 ns) and at every fast corner; with maximum wire RC (max_tt) it misses by 0.67 ns on ten paths (decode -> DPU1 partial sum, page table -> RoPE angle).
+- The slow corner (100 C, 1.60 V) misses by about 18-20 ns. The SRAM macro has only a TT timing view, so the ss numbers treat the SRAM as typical; about 26 MHz (20 ns + 18.7 ns period) is realistic there.
 - Detailed-route DRC 0, LVS clean (netgen: circuits match uniquely).
 - The reported power is vectorless at the idle clock gate and is not an operating figure; see results/power_gl_sram_p2_speed2.md for the gate-level number.
 
