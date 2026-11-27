@@ -276,7 +276,11 @@ module raijin_core #(
     reg  [LN-1:0] ttrow_r;
     always @(posedge clk) ttrow_r <= ttrow;
     wire [LN-1:0] rope_row = !twin ? addr_r[LD +: LN] : (tb < 6'd16) ? qrow : ttrow_r;
-    raijin_rope u_rope (.clk(clk), .we_even(rope_hit && !bcol[0]), .pair(bcol[3:1]),
+    // The column likewise comes straight from the bus address: the translated
+    // baddr also carries PTAB-mapped slots (token-window exponent writes),
+    // which put the page table in front of the RoPE table for STA.
+    wire [LD-1:0] rope_col = twin ? tb[LD-1:0] : addr_r[LD-1:0];
+    raijin_rope u_rope (.clk(clk), .we_even(rope_hit && !rope_col[0]), .pair(rope_col[3:1]),
         .pos(rope_abs ? ropepos : {{(8-LN){1'b0}}, rope_row}), .wdata(wdata_r),
         .xo(rope_xo), .yo(rope_yo));
 
@@ -406,10 +410,19 @@ module raijin_core #(
     end
     wire [LG-1:0] g_d2 = tag_d2[LK +: LG];
     wire [LK-1:0] j_d2 = tag_d2[LK-1:0];
-    wire          jd2_is4 = pfmt[j_d2[LK-1:LPG]];
-    wire [LK-1:0] pj_d2 = mx_on ? ({ptab[j_d2[LK-1:LPG]], {LPG{1'b0}}} + (jd2_is4 ? j_d2[LPG-1:0] : {j_d2[LPG-1:0], 1'b0}))
-                        : pg_on ? {ptab[j_d2[LK-1:LPG]], j_d2[LPG-1:0]} : j_d2;   // K row in d1_r
-    wire          k4_d2 = mx_on ? jd2_is4 : k4;
+    // Physical slot of the K row in d1_r. For timing it is computed from the
+    // stage-1 tag and registered, so the page table, PAGED/PFMT and the mode
+    // bits (all constant during a pass) do not sit in front of the DPUs.
+    wire [LK-1:0] j_d1    = tag_d1[LK-1:0];
+    wire          jd1_is4 = pfmt[j_d1[LK-1:LPG]];
+    wire [LK-1:0] pj_d1   = mx_on ? ({ptab[j_d1[LK-1:LPG]], {LPG{1'b0}}} + (jd1_is4 ? j_d1[LPG-1:0] : {j_d1[LPG-1:0], 1'b0}))
+                          : pg_on ? {ptab[j_d1[LK-1:LPG]], j_d1[LPG-1:0]} : j_d1;
+    reg  [LK-1:0] pj_d2;                     // K row in d1_r
+    reg           k4_d2;
+    always @(posedge clk) begin
+        pj_d2 <= pj_d1;
+        k4_d2 <= mx_on ? jd1_is4 : k4;
+    end
 
     // MXINT4 K/V: pick token t's half of the SRAM word and widen each nibble
     // to INT8 as x4 << 4 (the host's e_k / e_v account for the 4-bit shift).
