@@ -1,0 +1,2 @@
+token window plain: 16 tokens, 52 + 17 bytes per token, mean cos=0.99987
+token window paged+rope: 16 tokens, 52 + 17 bytes per token, mean cos=0.99946

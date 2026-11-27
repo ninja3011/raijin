@@ -1,0 +1,12 @@
+random   all INT8 (model, 1.5x the SRAM)     mean cos=0.99982
+random   all INT4               12 words  mean cos=0.98496 min cos=0.97430
+random   INT8 sink + recent     16 words  mean cos=0.99176 min cos=0.97390
+random   INT8 sink + outlier    16 words  mean cos=0.99302 min cos=0.97650
+sharp    all INT8 (model, 1.5x the SRAM)     mean cos=0.99978
+sharp    all INT4               12 words  mean cos=0.96555 min cos=0.81684
+sharp    INT8 sink + recent     16 words  mean cos=0.98747 min cos=0.83034
+sharp    INT8 sink + outlier    16 words  mean cos=0.99136 min cos=0.86346
+outliers all INT8 (model, 1.5x the SRAM)     mean cos=0.99967
+outliers all INT4               12 words  mean cos=0.97968 min cos=0.87567
+outliers INT8 sink + recent     16 words  mean cos=0.98457 min cos=0.88044
+outliers INT8 sink + outlier    16 words  mean cos=0.98457 min cos=0.88044

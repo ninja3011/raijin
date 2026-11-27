@@ -6,15 +6,20 @@
         "dir::../rtl/raijin_exp2.v",
         "dir::../rtl/raijin_softmax_lane.v",
         "dir::../rtl/raijin_acc_array.v",
+        "dir::../rtl/raijin_dupreg.v",
+        "dir::../rtl/raijin_rope.v",
+        "dir::../rtl/raijin_hh.v",
         "dir::../rtl/raijin_out.v",
         "dir::../rtl/raijin_core.v"
     ],
     "VERILOG_DEFINES": [
-        "RAIJIN_SKY130_SRAM"
+        "RAIJIN_SKY130_SRAM",
+        "RAIJIN_SKY130_CELLS"
     ],
     "SYNTH_PARAMETERS": [
         "P=2"
     ],
+    "LINTER_INCLUDE_PDK_MODELS": true,
     "CLOCK_PORT": "clk",
     "CLOCK_NET": "clk",
     "CLOCK_PERIOD": 20,

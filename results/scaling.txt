@@ -1,0 +1,34 @@
+Cycle model against the RTL (d = 16):
+kind     N/LEN  P   RTL model  error  source
+fused       16  2   173   173  +0.0%  test_all_modes, P=2
+fused       16  4   111   111  +0.0%  results/core_N16_D16.txt
+causal      16  2   153   153  +0.0%  test_causal_prefill, P=2
+causal      16  4    97    99  +2.1%  results/causal_N16_D16.txt
+decode       1  4    35    35  +0.0%  results/decode_N16_D16.txt
+decode       8  4    42    42  +0.0%  results/decode_N16_D16.txt
+decode      16  4    50    50  +0.0%  results/decode_N16_D16.txt
+decode      32  4    66    66  +0.0%  results/paged_N16_D16.txt (INT4, LEN=32)
+multi        4  4    41    41  +0.0%  results/multi_decode_N16_D16.txt
+multi        8  4    45    45  +0.0%  results/multi_decode_N16_D16.txt
+multi       16  4    53    53  +0.0%  results/multi_decode_N16_D16.txt
+
+Extrapolation at 45 MHz (one head; fused pass = prefill without mask, decode = one token over LEN cached keys):
+    N   d  P fused cycles  util   GOPS causal cycles decode LEN=N  tokens/s
+   16  16  2          173   74%   4.26           153           50   900,000
+   16  16  4          111   58%   6.64            99           50   900,000
+   16  16  8           83   39%   8.88            75           50   900,000
+   64  64  2         8237   99%   5.73          4257          290   155,172
+   64  64  4         4143   99%  11.39          2205          290   155,172
+   64  64  8         2099   98%  22.48          1183          290   155,172
+  128  64  2        32813  100%   5.75         16673          546    82,418
+  128  64  4        16431  100%  11.49          8477          546    82,418
+  128  64  8         8243   99%  22.90          4383          546    82,418
+  512  64  2       524333  100%   5.76        263201         2082    21,614
+  512  64  4       262191  100%  11.52        132125         2082    21,614
+  512  64  8       131123  100%  23.03         66591         2082    21,614
+ 2048 128  2     16777261  100%   5.76       8396825        16418     2,741
+ 2048 128  4      8388655  100%  11.52       4202523        16418     2,741
+ 2048 128  8      4194355  100%  23.04       2105375        16418     2,741
+
+Peak: 32 P MACs per cycle = 64 P ops per cycle; at 45 MHz that is 5.76 GOPS (P = 2), 11.5 GOPS (P = 4), 23.0 GOPS (P = 8). Utilisation of the pipelined fused pass tends to 100% as N grows, because the fixed 43 + P cycles (drain, reciprocal, last output rows) are paid once per pass.
+Decode is memory-bound by design: one token reads LEN K rows and LEN V rows, one each per cycle, so its time is LEN d/W + 34 cycles whatever P is; multi-query decode serves P query heads (GQA) in the same time.

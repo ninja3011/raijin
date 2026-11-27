@@ -1,0 +1,16 @@
+layer 0 head 0, 14 prompt tokens, causal prefill pass: 97 cycles, 2 skips
+mean row cosine vs the benchmark's decode-step outputs: 0.999993
+row  0 token  7454 e_o=124 o= 107 -116  -85  -16   73   15   -2   -7  -73  -73   33   16   75   31  -65   16 match
+row  1 token  2402 e_o=124 o= 102  -94  -63  -29   54    7  -11    3  -70  -61   14   25   28   49  -59   37 match
+row  2 token   257 e_o=124 o=  87  -67  -37  -15   45    7  -19    8  -49  -42    0   25    9   47  -43   44 match
+row  3 token   640 e_o=124 o=  71  -42  -11   -8   31    7  -28   18  -35  -19   -9   25   -8   47  -26   49 match
+row  4 token    11 e_o=124 o=  78  -48  -21  -40   22   -5  -25   22  -50  -31   -6   31  -23   51  -32   54 match
+row  5 token   612 e_o=123 o= 127  -50  -44  -62   66  -13  -46   45  -47  -36   39   38   -3   38  -24   95 match
+row  6 token   373 e_o=124 o=  73  -41  -25  -33   28   -5  -20   17  -41  -31    4   28   -7   44  -30   46 match
+row  7 token   257 e_o=124 o=  68  -38  -27  -20   36    0  -21   18  -34  -22   18   23    8   39  -25   42 match
+row  8 token  1310 e_o=124 o=  71  -44  -24  -12   23   11  -24   31  -18  -34    5   31  -19   39  -25   57 match
+row  9 token  2576 e_o=124 o= -11  -49  -47  -35   77   34  -34   58    2  -22    9   -1   15   26  -34   22 match
+row 10 token  3706 e_o=123 o= 103  -12    2  -37   33   24  -64   80    9  -18  -32   38  -20   20  -24  113 match
+row 11 token 20037 e_o=124 o=  72  -59  -34  -30   35    1  -13   24  -43  -34    1   23    8   30  -41   47 match
+row 12 token    13 e_o=124 o=  76  -40  -17  -48    5   12  -29   46  -34  -28  -23   33  -24   38  -38   71 match
+row 13 token  1375 e_o=124 o=  75  -22   -3  -61  -23   22  -36   69  -21  -23  -49   39  -42   30  -39   92 match

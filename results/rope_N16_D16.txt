@@ -1,0 +1,12 @@
+rope random fused=0 causal=0 mode=0        cycles= 411 mean_row_cos=0.99983
+rope random fused=1 causal=0 mode=0        cycles= 111 mean_row_cos=0.99984
+rope random fused=1 causal=1 mode=0        cycles=  97 mean_row_cos=0.99990
+rope random decode pos=200..215               cycles=  50 mean_cos=0.99986
+rope sharp fused=0 causal=0 mode=0         cycles= 411 mean_row_cos=0.99941
+rope sharp fused=1 causal=0 mode=0         cycles= 111 mean_row_cos=0.99946
+rope sharp fused=1 causal=1 mode=0         cycles=  97 mean_row_cos=0.99981
+rope sharp decode pos=200..215               cycles=  50 mean_cos=0.99823
+rope outliers fused=0 causal=0 mode=0      cycles= 411 mean_row_cos=0.99893
+rope outliers fused=1 causal=0 mode=0      cycles= 111 mean_row_cos=0.99905
+rope outliers fused=1 causal=1 mode=0      cycles=  97 mean_row_cos=0.99921
+rope outliers decode pos=200..215               cycles=  50 mean_cos=0.99940

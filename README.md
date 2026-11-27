@@ -8,11 +8,27 @@ unit. One controller runs attention two ways on the same hardware:
 - **Fused**: keys stream past four query rows with base-2 online softmax, so the
   N×N score matrix is never stored.
 
+A causal flag (CTRL bit 5) makes the fused pass causal, for prompt prefill in
+decoder models. Fused query groups are pipelined back to back
+(`docs/performance.md`; prior work in `docs/comparison.md`).
+
 A third mode, decode, is one KV-cache step of autoregressive generation: one
 query row attends to the LEN keys and values already held in SRAM.
 
 Q, K, V, O and the score buffer live in four 1 KB sky130 SRAM macros
 (`docs/sram_kv.md`).
+
+For LLM inference the core adds:
+- multi-query and speculative decode;
+- a paged KV cache in MXINT8, MXINT4 or MXFP4, chosen per tensor or per page;
+- attention sinks;
+- RoPE applied as rows are written;
+- hardware key skip, and a max-first decode mode that reads V only for keys with nonzero weight;
+- a heavy-hitter (H2O) tracker that names the KV entry to evict.
+
+The tapeout top level, `rtl/raijin_chip.v`, wraps the core with an SPI host
+port and idle clock gating. `docs/performance.md` (and `docs/comparison.md` for prior work) documents each feature,
+with measurements.
 
 The softmax-to-V path has an exact mode (16-entry LUT, 9×8 multipliers) and two
 multiplier-free modes where each probability is one or two powers of two, so
@@ -29,8 +45,8 @@ A7-100T through Vivado.
 | `model/raijin_model.py` | Bit-exact golden model, quantisation helpers, FP32 reference |
 | `model/accuracy.py` | Accuracy study of every numeric variant against FP32 |
 | `rtl/` | Core RTL (Verilog-2005); `raijin_mem.v` models the SRAM macro |
-| `tb/` | cocotb tests (block level and full pass) |
-| `openlane/` | OpenLane 2 configs; `config_sram_p2.json` is the SRAM build, `macros/` its macro views |
+| `tb/` | cocotb tests (block level, full pass, and chip level over SPI) |
+| `openlane/` | OpenLane 2 configs: `config_sram_p2.json` is the SRAM core build, `config_chip_p2.json` the chip top (SPI and clock gate), and `macros/` holds the macro views |
 | `fpga/` | Arty A7-100T top, UART bridge, constraints, Vivado scripts, host script |
 | `docs/` | Numerics and architecture notes |
 | `scripts/dock.sh` | Runs any command inside the `hpretl/iic-osic-tools` container |

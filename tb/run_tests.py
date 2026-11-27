@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build and run every cocotb test with Icarus Verilog.
 
-Usage: python3 tb/run_tests.py [blocks|core|all] [--sim icarus|verilator]
+Usage: python3 tb/run_tests.py [blocks|core|uart|chip|all] [--sim icarus|verilator]
 Run it inside the tools container: scripts/dock.sh python3 tb/run_tests.py
 """
 import argparse
@@ -15,9 +15,13 @@ ROOT = Path(__file__).resolve().parent.parent
 RTL = ROOT / "rtl"
 SOURCES = [RTL / f for f in (
     "raijin_dpu.v", "raijin_requant.v", "raijin_exp2.v", "raijin_softmax_lane.v",
-    "raijin_acc_array.v", "raijin_out.v", "raijin_mem.v", "raijin_core.v")]
+    "raijin_acc_array.v", "raijin_dupreg.v", "raijin_rope.v", "raijin_hh.v", "raijin_out.v", "raijin_mem.v", "raijin_core.v",
+    "raijin_spi.v", "raijin_chip.v")]
 
-BLOCKS = ["raijin_exp2", "raijin_requant", "raijin_dpu", "raijin_out", "raijin_softmax_lane"]
+# RAIJIN_WAVES=1 dumps a VCD (for power annotation); pair with COCOTB_TEST_FILTER to pick one test
+WAVES = bool(os.environ.get("RAIJIN_WAVES"))
+
+BLOCKS = ["raijin_exp2", "raijin_requant", "raijin_dpu", "raijin_out", "raijin_softmax_lane", "raijin_rope"]
 
 
 FPGA_SOURCES = [ROOT / "fpga" / "rtl" / f for f in ("uart_rx.v", "uart_tx.v", "raijin_bridge.v")] + \
@@ -43,25 +47,25 @@ def run(top, module, sim, params=None, extra_env=None, macro=False):
     sources = SOURCES + (FPGA_SOURCES if top == "raijin_uart_tb_top" else [])
     build_dir = ROOT / "sim_build" / f"{top}_{sim}{'_macro' if macro else ''}"
     build_args = ["-Wall"] if sim == "icarus" else ["-Wno-fatal", "-Wno-WIDTH"]
-    defines = {}
+    defines = {"RAIJIN_TRACE": 1} if os.environ.get("RAIJIN_TRACE") else {}
     if macro:
         # simulate against the real OpenRAM macro model instead of rtl/raijin_mem.v
         sources = [s for s in sources if s.name != "raijin_mem.v"] + [macro_model(build_dir)]
-        defines = {"RAIJIN_SKY130_SRAM": 1}
+        defines = dict(defines, RAIJIN_SKY130_SRAM=1)
     runner.build(sources=sources, hdl_toplevel=top, build_dir=build_dir, defines=defines,
-                 parameters=params or {}, always=True, build_args=build_args, waves=False,
+                 parameters=params or {}, always=True, build_args=build_args, waves=WAVES,
                  timescale=("1ns", "1ps"))
     env = dict(extra_env or {})
     env["COCOTB_TOPLEVEL"] = top
     os.environ.update(env)
     res = runner.test(hdl_toplevel=top, test_module=module, test_dir=ROOT / "tb",
-                      build_dir=build_dir, extra_env=env)
+                      build_dir=build_dir, extra_env=env, waves=WAVES)
     return res
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("what", nargs="?", default="all", choices=["blocks", "core", "uart", "all"])
+    ap.add_argument("what", nargs="?", default="all", choices=["blocks", "core", "uart", "chip", "all"])
     ap.add_argument("--sim", default="icarus")
     ap.add_argument("--n", type=int, default=16)
     ap.add_argument("--p", type=int, default=4, help="DPUs / softmax lanes")
@@ -74,9 +78,12 @@ def main():
             run(top, "test_blocks", args.sim)
     if args.what in ("core", "all"):
         run("raijin_core", "test_core", args.sim, params={"N": args.n, "D": 16, "P": args.p},
-            extra_env={"RAIJIN_N": str(args.n), "RAIJIN_D": "16"}, macro=args.macro)
+            extra_env={"RAIJIN_N": str(args.n), "RAIJIN_D": "16", "RAIJIN_P": str(args.p)}, macro=args.macro)
     if args.what in ("uart", "all"):
         run("raijin_uart_tb_top", "test_uart", args.sim)
+    if args.what in ("chip", "all"):
+        run("raijin_chip", "test_chip", args.sim, params={"N": args.n, "D": 16, "P": args.p},
+            extra_env={"RAIJIN_N": str(args.n), "RAIJIN_D": "16", "RAIJIN_P": str(args.p)})
 
 
 if __name__ == "__main__":

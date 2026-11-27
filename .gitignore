@@ -12,3 +12,4 @@ fpga/*.log
 .Xil/
 results/*.log
 tb/test_debug.py
+eval/data/wikitext-2/

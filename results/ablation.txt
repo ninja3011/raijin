@@ -1,0 +1,27 @@
+Ablation of Raijin's features on one attention layer of a small edge LLM.
+
+Workload: 8 query heads, 2 KV heads (GQA 4:1), head dim d = 64, a 512-token
+prompt (causal prefill) followed by 512 generated tokens. P = 4, 45 MHz.
+Cycle counts come from the validated model in eval/scaling.py; accuracy from
+results/lm_perplexity.json. Each row adds one feature to the row above.
+
+configuration                 prefill cyc prefill ms  decode cyc/tok    tok/s KV B/tok/head V reads/tok     ppl
+baseline (sram-kv)              4,341,760      96.48          24,832    1,812           136       6,140  4.8588
++ group pipelining (2)          4,341,760      96.48          24,832    1,812           136       6,140  4.8588
++ causal prefill (3)            1,057,000      23.49          24,832    1,812           136       6,140  4.8588
++ GQA decode (4)                1,057,000      23.49           6,214    7,242           136       1,535  4.8588
++ INT4 V cache (6)              1,057,000      23.49           6,214    7,242           104       1,535  4.8907
++ key skip, SKIPTHR=6 (8)       1,057,000      23.49           6,214    7,242           104       1,156  4.8915
++ MF2 exponent (operating pt)    1,057,000      23.49           6,214    7,242           104       1,156  4.8863
+
+Prefill 4.1x faster, decode 4.0x faster, KV storage 1.31x smaller, V reads 5.3x fewer.
+Perplexity: FP32 attention is 4.8515. The skip fraction (24.7% of keys) is the one measured in the LM.
+
+Group pipelining on a full fused (non-causal, encoder-style) pass, one head:
+    N   d  unpipelined  pipelined  speed-up
+   16  16          192        111     1.73x
+   64  64        4,608      4,143     1.11x
+  128  64       17,408     16,431     1.06x
+  512  64      266,240    262,191     1.02x
+
+Host link per decode token at N = 16 (measured, features 11-13): SPI 135 us, QSPI 66.9 us, QSPI + token window 36.2 us (7,400 -> 27,700 tokens/s).
